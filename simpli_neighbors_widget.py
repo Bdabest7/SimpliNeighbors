@@ -132,24 +132,24 @@ def _make_slider_row(
 
     low_lbl = QLabel("Low")
     low_lbl.setObjectName("lowLabel")
-    low_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+    low_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
-    slider = QSlider(Qt.Horizontal)
+    slider = QSlider(Qt.Orientation.Horizontal)
     slider.setMinimum(minimum)
     slider.setMaximum(maximum)
     slider.setValue(default)
-    slider.setTickPosition(QSlider.TicksBelow)
+    slider.setTickPosition(QSlider.TickPosition.TicksBelow)
     slider.setTickInterval(max(1, (maximum - minimum) // 10))
 
     high_lbl = QLabel("High")
     high_lbl.setObjectName("highLabel")
-    high_lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+    high_lbl.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
 
     spinbox = QSpinBox()
     spinbox.setMinimum(minimum)
     spinbox.setMaximum(maximum)
     spinbox.setValue(default)
-    spinbox.setAlignment(Qt.AlignCenter)
+    spinbox.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
     row.addWidget(low_lbl)
     row.addWidget(slider, stretch=1)
@@ -159,7 +159,7 @@ def _make_slider_row(
 
     sub = QLabel(subtitle)
     sub.setObjectName("subtitleLabel")
-    sub.setAlignment(Qt.AlignCenter)
+    sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
     root.addWidget(sub)
 
     # bidirectional sync
@@ -278,7 +278,7 @@ class ResolutionWidget(QWidget):
         self._value_input.setMaximum(9999.0)
         self._value_input.setDecimals(4)
         self._value_input.setValue(1.0)
-        self._value_input.setAlignment(Qt.AlignCenter)
+        self._value_input.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._value_input.setEnabled(False)
 
         row.addWidget(self._btn_default)
@@ -318,13 +318,40 @@ class ResolutionWidget(QWidget):
 
 
 # ---------------------------------------------------------------------------
+# Dialog type lookup — mirrors QGIS's own Wrappers.py pattern exactly.
+# QGIS 4.x passes the AlgorithmDialog *object* as arg 2 (not the enum).
+# Must resolve to QgsProcessingGui.WidgetType before calling super().__init__.
+# row/col are Python-only layout hints — NOT forwarded to the C++ base.
+# ---------------------------------------------------------------------------
+
+from qgis.gui import QgsProcessingGui  # noqa: E402  (needed here for the dict)
+
+_DIALOG_TYPES = {
+    "AlgorithmDialog":        QgsProcessingGui.WidgetType.Standard,
+    "ModelerParametersDialog": QgsProcessingGui.WidgetType.Modeler,
+    "BatchAlgorithmDialog":   QgsProcessingGui.WidgetType.Batch,
+}
+
+
+def _resolve_dialog_type(dialog):
+    return _DIALOG_TYPES.get(
+        dialog.__class__.__name__,
+        QgsProcessingGui.WidgetType.Standard,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Processing wrapper classes
 # ---------------------------------------------------------------------------
 
 class SimpliNeighborsRadiusWrapper(QgsAbstractProcessingParameterWidgetWrapper):
     def __init__(self, parameter: QgsProcessingParameterDefinition,
-                 dialog_type, parent: QWidget | None = None) -> None:
-        super().__init__(parameter, dialog_type, parent)
+                 dialog, row: int = 0, col: int = 0, **kwargs) -> None:
+        self.dialogType = _resolve_dialog_type(dialog)
+        super().__init__(parameter, self.dialogType)
+        self._dialog = dialog
+        self.row = row
+        self.col = col
 
     def createWidget(self) -> QWidget:
         self._widget = SmoothingWidget()
@@ -343,8 +370,12 @@ class SimpliNeighborsRadiusWrapper(QgsAbstractProcessingParameterWidgetWrapper):
 
 class SimpliNeighborsCoresWrapper(QgsAbstractProcessingParameterWidgetWrapper):
     def __init__(self, parameter: QgsProcessingParameterDefinition,
-                 dialog_type, parent: QWidget | None = None) -> None:
-        super().__init__(parameter, dialog_type, parent)
+                 dialog, row: int = 0, col: int = 0, **kwargs) -> None:
+        self.dialogType = _resolve_dialog_type(dialog)
+        super().__init__(parameter, self.dialogType)
+        self._dialog = dialog
+        self.row = row
+        self.col = col
 
     def createWidget(self) -> QWidget:
         self._widget = CoresWidget()
@@ -363,8 +394,12 @@ class SimpliNeighborsCoresWrapper(QgsAbstractProcessingParameterWidgetWrapper):
 
 class SimpliNeighborsResolutionWrapper(QgsAbstractProcessingParameterWidgetWrapper):
     def __init__(self, parameter: QgsProcessingParameterDefinition,
-                 dialog_type, parent: QWidget | None = None) -> None:
-        super().__init__(parameter, dialog_type, parent)
+                 dialog, row: int = 0, col: int = 0, **kwargs) -> None:
+        self.dialogType = _resolve_dialog_type(dialog)
+        super().__init__(parameter, self.dialogType)
+        self._dialog = dialog
+        self.row = row
+        self.col = col
 
     def createWidget(self) -> QWidget:
         self._widget = ResolutionWidget()
