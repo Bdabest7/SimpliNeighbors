@@ -2,9 +2,18 @@
 # Copyright (C) 2024 SimpliFly
 # SPDX-License-Identifier: AGPL-3.0-or-later
 #
-# Equivalent to: r.neighbors method=median size=(2*radius+1)
-# Uses scipy.ndimage.median_filter with tiled ThreadPoolExecutor for maximum
-# speed without spawning new processes (avoids QGIS re-launch on Windows).
+# Optimised for golf course fairway / green DTM smoothing:
+#   — Removes vegetation spikes and scanner noise (Pass 1: Median)
+#   — Preserves sharp topographic breaks (bunker lips, green collars)
+#   — Eliminates terracing on gentle slopes (Pass 2: Gaussian / Bilateral)
+#
+# Smoothing modes:
+#   0 — Two-Pass: large Median (despiking) → small Gaussian (anti-aliasing)
+#   1 — Median only: classic r.neighbors method=median equivalent
+#   2 — Bilateral: bundled pure-NumPy edge-preserving filter (no OpenCV needed)
+#
+# Processing uses tiled ThreadPoolExecutor so all CPU cores run in parallel
+# without spawning new processes (avoids QGIS re-launch on Windows).
 
 from __future__ import annotations
 
@@ -21,8 +30,8 @@ from qgis.core import (
     QgsProcessingContext,
     QgsProcessingException,
     QgsProcessingFeedback,
-    QgsProcessingParameterEnum,
     QgsProcessingParameterNumber,
+    QgsProcessingParameterEnum,
     QgsProcessingParameterRasterDestination,
     QgsProcessingParameterRasterLayer,
     QgsProcessingParameterString,
@@ -31,16 +40,117 @@ from qgis.core import (
 gdal.UseExceptions()
 
 TILE_SIZE = 512  # px — good L2/L3 cache footprint per thread
-
 _CPU_COUNT = os.cpu_count() or 1
 
+# Enum indices for SMOOTH_MODE
+MODE_TWO_PASS  = 0
+MODE_MEDIAN    = 1
+MODE_BILATERAL = 2
+
+SMOOTH_MODE_OPTIONS = [
+    "Two-Pass: Median + Gaussian  (recommended — no terracing)",
+    "Median only  (fast despiking, may terrace on gentle slopes)",
+    "Bilateral  (best quality — preserves bunker lips, smooths fairway slopes)",
+]
+
 # ---------------------------------------------------------------------------
-# Thread worker — runs inside ThreadPoolExecutor (scipy releases the GIL)
+# Presets
+# ---------------------------------------------------------------------------
+# Each preset is (label, smooth_mode, radius, gaussian_sigma).
+# sigma meaning depends on mode:
+#   Two-Pass  → gaussian_sigma is anti-aliasing px
+#   Bilateral → gaussian_sigma is sigma_color in map units (e.g. metres)
+
+PRESET_CUSTOM = 0
+
+PRESETS = [
+    # index 0 — sentinel, user controls all parameters manually
+    ("Custom  (use values below)", None, None, None),
+
+    # Whole-course at 7 cm/px — the primary use case.
+    # Bilateral sigma_color=0.10 m: fairway slopes change <7 cm over 49 cm
+    # window → smooth blending everywhere; collar breaks (≥8 cm) and bunker
+    # lips (≥20 cm) exceed the threshold → hard-preserved.
+    ("Whole Course — Standard  (Bilateral R=16, σ=0.10 m)",
+     MODE_BILATERAL, 16, 0.10),
+
+    # Heavier vegetation (rough, tree drip-lines).  Larger median window
+    # kills tall shrub hits; Two-Pass Gaussian removes resulting terracing.
+    ("Whole Course — Heavy Vegetation  (Two-Pass R=5, σ=1.5 px)",
+     MODE_TWO_PASS, 5, 1.5),
+
+    # Greens-focused: tighter sigma_color preserves even subtle collar
+    # transitions (≥8 cm).
+    ("Greens / Approaches  (Bilateral R=3, σ=0.08 m)",
+     MODE_BILATERAL, 3, 0.08),
+
+    # Fairways only, no complex edge geometry needed.
+    ("Fairways / Tees  (Two-Pass R=3, σ=1.5 px)",
+     MODE_TWO_PASS, 3, 1.5),
+]
+
+PRESET_OPTIONS = [p[0] for p in PRESETS]
+
+
+# ---------------------------------------------------------------------------
+# Tile worker (called inside ThreadPoolExecutor — scipy/cv2 release the GIL)
 # ---------------------------------------------------------------------------
 
-def _filter_tile(tile_data: np.ndarray, filter_size: int) -> np.ndarray:
-    from scipy.ndimage import median_filter
-    return median_filter(tile_data.astype(np.float32), size=filter_size)
+def _filter_tile(
+    tile_data: np.ndarray,
+    filter_size: int,
+    mode: int,
+    gaussian_sigma: float,
+) -> np.ndarray:
+    """
+    Apply the selected smoothing algorithm to one tile.
+
+    Two-Pass (mode 0) — recommended for golf course DTMs
+    -----------------------------------------------------
+    Pass 1 — median_filter(size=filter_size):
+        Kills vegetation spikes and scanner noise. The median is inherently
+        robust to outliers so sharp edges (bunker lips, green collars, cart
+        path kerbs) are preserved. On gentle fairway / green slopes this
+        introduces micro-terracing.
+
+    Pass 2 — gaussian_filter(sigma=gaussian_sigma):
+        Narrow Gaussian acts as fine-grit sandpaper — dissolves the
+        micro-steps back into a continuous gradient without being wide
+        enough to round off the macroscopic edges saved by Pass 1.
+
+    Median only (mode 1)
+    --------------------
+    Diagnostic / legacy mode. Good when you only need spike removal and
+    terracing is acceptable (very flat terrain, coarse GSD).
+
+    Bilateral (mode 2) — best for complex green / bunker geometry
+    -------------------------------------------------------------
+    Bundled pure-NumPy implementation (no OpenCV required).
+    Weights each neighbour by both spatial distance AND elevation difference.
+    Smooths continuous slopes (fairway undulations, green bowls) while
+    mathematically halting at intensity edges (bunker lips, green perimeter
+    breaks). Ideal when sigma_color is tuned to the expected lip height
+    (e.g. 0.15 m for a 15 cm bunker lip on a metre-scale DTM).
+    """
+    data = tile_data.astype(np.float32)
+
+    if mode == MODE_MEDIAN:
+        from scipy.ndimage import median_filter
+        return median_filter(data, size=filter_size)
+
+    if mode == MODE_BILATERAL:
+        from .simpli_bilateral import bilateral_filter
+        # sigma_space: spatial reach — use 1/3 of window so edge weights taper
+        sigma_space = max(filter_size / 3.0, 1.0)
+        # sigma_color: elevation range — gaussian_sigma repurposed as map units
+        return bilateral_filter(data, filter_size,
+                                sigma_space=sigma_space,
+                                sigma_color=gaussian_sigma)
+
+    # Two-Pass (default)
+    from scipy.ndimage import median_filter, gaussian_filter
+    despiked = median_filter(data, size=filter_size)
+    return gaussian_filter(despiked, sigma=gaussian_sigma)
 
 
 # ---------------------------------------------------------------------------
@@ -49,11 +159,14 @@ def _filter_tile(tile_data: np.ndarray, filter_size: int) -> np.ndarray:
 
 class SimpliNeighborsAlgorithm(QgsProcessingAlgorithm):
 
-    INPUT           = "INPUT"
-    RADIUS          = "RADIUS"
-    THREADS         = "THREADS"
-    RESOLUTION      = "RESOLUTION"   # str: "default" | float-as-string
-    OUTPUT          = "OUTPUT"
+    INPUT          = "INPUT"
+    PRESET         = "PRESET"
+    SMOOTH_MODE    = "SMOOTH_MODE"
+    RADIUS         = "RADIUS"
+    GAUSSIAN_SIGMA = "GAUSSIAN_SIGMA"
+    THREADS        = "THREADS"
+    RESOLUTION     = "RESOLUTION"
+    OUTPUT         = "OUTPUT"
 
     # ------------------------------------------------------------------
     # Identity
@@ -73,14 +186,26 @@ class SimpliNeighborsAlgorithm(QgsProcessingAlgorithm):
 
     def shortHelpString(self) -> str:
         return (
-            "Applies a fast parallel median filter to a raster layer, "
-            "equivalent to GRASS r.neighbors method=median.\n\n"
-            "Radius (px): half the neighborhood side. "
-            "Radius R → (2R+1)×(2R+1) window.\n\n"
-            "CPU cores: number of threads (scipy releases the GIL — "
-            "all cores run fully parallel).\n\n"
-            "Output resolution: 'default' keeps the original pixel size; "
-            "enter a number (in map units/px) to resample before filtering."
+            "<b>Designed for golf course fairway and green DTM smoothing.</b>"
+            "<br><br>"
+            "<b>Two-Pass (recommended)</b>: Median despiking followed by a "
+            "narrow Gaussian. Removes grass / vegetation hits and scanner "
+            "noise; eliminates terracing on gentle fairway slopes; preserves "
+            "bunker lips and green collars.<br><br>"
+            "<b>Bilateral (best quality)</b>: Bundled pure-NumPy "
+            "edge-preserving filter — no OpenCV needed. Smooths continuous "
+            "gradients (green bowls, fairway undulations) while halting at "
+            "intensity edges (bunker lips, collar breaks). Set "
+            "<i>Gaussian sigma</i> to the expected lip height in map units "
+            "(e.g. 0.15 for a 15 cm bunker lip on a metre-scale DTM).<br><br>"
+            "<b>Median only</b>: Classic r.neighbors equivalent. Fast spike "
+            "removal; may terrace on gentle slopes.<br><br>"
+            "<b>Radius</b>: half the median window (R → (2R+1)² px). "
+            "At 1 cm/px GSD: radius 6 = 13×13 cm window — enough to remove "
+            "grass blades while keeping fairway microrelief.<br><br>"
+            "<b>Gaussian sigma</b>: Two-Pass anti-aliasing width in pixels "
+            "(1–2 px typical). Bilateral: intensity range threshold in map "
+            "units — set near the smallest edge height you want to preserve."
         )
 
     def createInstance(self) -> "SimpliNeighborsAlgorithm":
@@ -94,16 +219,36 @@ class SimpliNeighborsAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(
             QgsProcessingParameterRasterLayer(
                 self.INPUT,
-                "Input raster (DSM)",
+                "Input raster (golf course DTM/DSM)",
+            )
+        )
+
+        # PRESET — shown first; overrides all parameters below when not Custom
+        self.addParameter(
+            QgsProcessingParameterEnum(
+                self.PRESET,
+                "Preset  (overrides settings below when not Custom)",
+                options=PRESET_OPTIONS,
+                defaultValue=1,   # "Whole Course — Standard" is the default
+            )
+        )
+
+        # Smoothing mode — standard enum dropdown
+        self.addParameter(
+            QgsProcessingParameterEnum(
+                self.SMOOTH_MODE,
+                "Smoothing algorithm  [ignored when Preset ≠ Custom]",
+                options=SMOOTH_MODE_OPTIONS,
+                defaultValue=MODE_BILATERAL,
             )
         )
 
         # RADIUS — custom slider widget
         radius_param = QgsProcessingParameterNumber(
             self.RADIUS,
-            "Median filter radius (px)",
+            "Median filter radius (px)  [ignored when Preset ≠ Custom]",
             type=QgsProcessingParameterNumber.Integer,
-            defaultValue=6,
+            defaultValue=16,
             minValue=1,
             maxValue=50,
         )
@@ -115,6 +260,18 @@ class SimpliNeighborsAlgorithm(QgsProcessingAlgorithm):
         except Exception:
             pass
         self.addParameter(radius_param)
+
+        # GAUSSIAN_SIGMA — anti-aliasing sigma / bilateral intensity range
+        self.addParameter(
+            QgsProcessingParameterNumber(
+                self.GAUSSIAN_SIGMA,
+                "Gaussian sigma  [Two-Pass: anti-aliasing px | Bilateral: edge threshold in map units]  [ignored when Preset ≠ Custom]",
+                type=QgsProcessingParameterNumber.Double,
+                defaultValue=0.10,
+                minValue=0.01,
+                maxValue=10.0,
+            )
+        )
 
         # THREADS — custom slider widget
         threads_param = QgsProcessingParameterNumber(
@@ -134,7 +291,7 @@ class SimpliNeighborsAlgorithm(QgsProcessingAlgorithm):
             pass
         self.addParameter(threads_param)
 
-        # RESOLUTION — custom Default/Custom widget (stored as string)
+        # RESOLUTION — custom Default/Custom widget
         res_param = QgsProcessingParameterString(
             self.RESOLUTION,
             "Output resolution",
@@ -173,34 +330,55 @@ class SimpliNeighborsAlgorithm(QgsProcessingAlgorithm):
         if raster_layer is None:
             raise QgsProcessingException("Invalid input raster layer.")
 
-        radius: int     = self.parameterAsInt(parameters, self.RADIUS, context)
-        threads: int    = self.parameterAsInt(parameters, self.THREADS, context)
-        res_str: str    = self.parameterAsString(parameters, self.RESOLUTION, context).strip()
+        preset_idx: int = self.parameterAsEnum(parameters, self.PRESET, context)
+
+        if preset_idx != PRESET_CUSTOM:
+            # Preset overrides individual controls
+            _, smooth_mode, radius, gaussian_sigma = PRESETS[preset_idx]
+            feedback.pushInfo(f"Preset: {PRESET_OPTIONS[preset_idx]}")
+        else:
+            smooth_mode: int      = self.parameterAsEnum(parameters, self.SMOOTH_MODE, context)
+            radius: int           = self.parameterAsInt(parameters, self.RADIUS, context)
+            gaussian_sigma: float = self.parameterAsDouble(parameters, self.GAUSSIAN_SIGMA, context)
+            feedback.pushInfo("Preset: Custom")
+
+        threads: int     = self.parameterAsInt(parameters, self.THREADS, context)
+        res_str: str     = self.parameterAsString(parameters, self.RESOLUTION, context).strip()
         output_path: str = self.parameterAsOutputLayer(parameters, self.OUTPUT, context)
 
         filter_size = 2 * radius + 1
+        mode_label = SMOOTH_MODE_OPTIONS[smooth_mode].split("(")[0].strip()
+
+        feedback.pushInfo(f"Mode: {mode_label}")
         feedback.pushInfo(
-            f"Median filter: radius={radius} px  →  window={filter_size}×{filter_size}"
+            f"Median radius={radius} px  →  window={filter_size}×{filter_size}"
         )
+        if smooth_mode in (MODE_TWO_PASS, MODE_BILATERAL):
+            feedback.pushInfo(f"Gaussian sigma / sigmaColor = {gaussian_sigma}")
         feedback.pushInfo(f"Threads: {threads} / {_CPU_COUNT}")
+
+        if smooth_mode == MODE_BILATERAL:
+            feedback.pushInfo(
+                "Bilateral: bundled NumPy implementation — no OpenCV required."
+            )
 
         # ---- open with GDAL --------------------------------------------
         src_path = raster_layer.source()
 
-        # Optional resampling step
         target_res = _parse_resolution(res_str)
         if target_res is not None:
             feedback.pushInfo(f"Resampling to {target_res} map units/px …")
             resampled = os.path.join(
                 tempfile.gettempdir(), "simplineighbors_resampled.tif"
             )
-            warp_opts = gdal.WarpOptions(
-                xRes=target_res,
-                yRes=target_res,
-                resampleAlg=gdal.GRA_Bilinear,
-                creationOptions=["COMPRESS=LZW", "TILED=YES"],
+            gdal.Warp(
+                resampled, src_path,
+                options=gdal.WarpOptions(
+                    xRes=target_res, yRes=target_res,
+                    resampleAlg=gdal.GRA_Bilinear,
+                    creationOptions=["COMPRESS=LZW", "TILED=YES"],
+                ),
             )
-            gdal.Warp(resampled, src_path, options=warp_opts)
             src_path = resampled
 
         ds: gdal.Dataset = gdal.Open(src_path, gdal.GA_ReadOnly)
@@ -213,8 +391,8 @@ class SimpliNeighborsAlgorithm(QgsProcessingAlgorithm):
         geotransform    = ds.GetGeoTransform()
         projection      = ds.GetProjection()
         nodata          = band.GetNoDataValue()
+        pixel_size      = abs(geotransform[1])
 
-        pixel_size = abs(geotransform[1])
         feedback.pushInfo(
             f"Raster size: {cols} × {rows} px  |  pixel size: {pixel_size:.6g} map units"
         )
@@ -231,24 +409,30 @@ class SimpliNeighborsAlgorithm(QgsProcessingAlgorithm):
             data[nodata_mask] = fill_val
 
         # ---- tiling ----------------------------------------------------
-        overlap = radius
+        # Overlap must cover the full median radius + Gaussian reach.
+        # Gaussian with sigma s has effective radius ~3s, so overlap = radius + ceil(3*sigma).
+        gaussian_reach = math.ceil(3.0 * gaussian_sigma) if smooth_mode != MODE_MEDIAN else 0
+        overlap = radius + gaussian_reach
+
         tiles = _build_tiles(rows, cols, TILE_SIZE, overlap)
         n_tiles = len(tiles)
         feedback.pushInfo(
-            f"Processing {n_tiles} tiles ({TILE_SIZE}px core + {overlap}px overlap) "
-            f"on {threads} thread(s) …"
+            f"Processing {n_tiles} tiles "
+            f"({TILE_SIZE}px core + {overlap}px overlap) on {threads} thread(s) …"
         )
 
         output: np.ndarray = np.empty_like(data)
         completed = 0
 
-        # ---- parallel execution (ThreadPoolExecutor — scipy GIL-free) --
+        # ---- parallel execution ----------------------------------------
         with ThreadPoolExecutor(max_workers=threads) as pool:
             futures = {
                 pool.submit(
                     _filter_tile,
                     data[t["src_r0"]:t["src_r1"], t["src_c0"]:t["src_c1"]],
                     filter_size,
+                    smooth_mode,
+                    gaussian_sigma,
                 ): t
                 for t in tiles
             }
@@ -258,16 +442,17 @@ class SimpliNeighborsAlgorithm(QgsProcessingAlgorithm):
                     pool.shutdown(wait=False, cancel_futures=True)
                     raise QgsProcessingException("Cancelled by user.")
 
-                tile = futures[future]
+                tile   = futures[future]
                 result = future.result()
 
                 r_off = tile["dst_r0"] - tile["src_r0"]
                 c_off = tile["dst_c0"] - tile["src_c0"]
-                h = tile["dst_r1"] - tile["dst_r0"]
-                w = tile["dst_c1"] - tile["dst_c0"]
-                output[tile["dst_r0"]:tile["dst_r1"], tile["dst_c0"]:tile["dst_c1"]] = (
-                    result[r_off: r_off + h, c_off: c_off + w]
-                )
+                h     = tile["dst_r1"] - tile["dst_r0"]
+                w     = tile["dst_c1"] - tile["dst_c0"]
+                output[
+                    tile["dst_r0"]:tile["dst_r1"],
+                    tile["dst_c0"]:tile["dst_c1"],
+                ] = result[r_off: r_off + h, c_off: c_off + w]
 
                 completed += 1
                 feedback.setProgress(int(completed / n_tiles * 100))
@@ -308,7 +493,6 @@ class SimpliNeighborsAlgorithm(QgsProcessingAlgorithm):
 # ---------------------------------------------------------------------------
 
 def _parse_resolution(value: str) -> float | None:
-    """Return float if a custom resolution was requested, else None."""
     v = value.strip().lower()
     if v in ("", "default"):
         return None
@@ -321,10 +505,8 @@ def _parse_resolution(value: str) -> float | None:
 
 def _build_tiles(rows: int, cols: int, tile_size: int, overlap: int) -> list[dict]:
     tiles = []
-    n_row = math.ceil(rows / tile_size)
-    n_col = math.ceil(cols / tile_size)
-    for ri in range(n_row):
-        for ci in range(n_col):
+    for ri in range(math.ceil(rows / tile_size)):
+        for ci in range(math.ceil(cols / tile_size)):
             dst_r0 = ri * tile_size
             dst_r1 = min(dst_r0 + tile_size, rows)
             dst_c0 = ci * tile_size

@@ -66,8 +66,24 @@ def test_algorithm_params():
     alg = SimpliNeighborsAlgorithm()
     alg.initAlgorithm()
     names = [p.name() for p in alg.parameterDefinitions()]
-    for expected in ("INPUT", "RADIUS", "THREADS", "RESOLUTION", "OUTPUT"):
+    for expected in ("INPUT", "PRESET", "SMOOTH_MODE", "RADIUS", "GAUSSIAN_SIGMA",
+                     "THREADS", "RESOLUTION", "OUTPUT"):
         assert expected in names, f"Missing parameter: {expected}"
+
+def test_presets_valid():
+    from simpli_neighbors_algorithm import (
+        PRESETS, PRESET_CUSTOM, MODE_TWO_PASS, MODE_MEDIAN, MODE_BILATERAL
+    )
+    valid_modes = {MODE_TWO_PASS, MODE_MEDIAN, MODE_BILATERAL}
+    for i, (label, mode, radius, sigma) in enumerate(PRESETS):
+        if i == PRESET_CUSTOM:
+            assert mode is None
+            continue
+        assert mode in valid_modes,          f"Preset {i} has invalid mode {mode}"
+        assert isinstance(radius, int),      f"Preset {i} radius must be int"
+        assert 1 <= radius <= 50,            f"Preset {i} radius {radius} out of range"
+        assert isinstance(sigma, float),     f"Preset {i} sigma must be float"
+        assert sigma > 0,                    f"Preset {i} sigma must be > 0"
 
 def test_algorithm_identity():
     from simpli_neighbors_algorithm import SimpliNeighborsAlgorithm
@@ -77,8 +93,9 @@ def test_algorithm_identity():
     inst = alg.createInstance()
     assert isinstance(inst, SimpliNeighborsAlgorithm)
 
-test("algorithm has all 5 expected parameters", test_algorithm_params)
+test("algorithm has all 8 expected parameters", test_algorithm_params)
 test("algorithm name/group/createInstance",     test_algorithm_identity)
+test("all presets have valid mode/radius/sigma", test_presets_valid)
 
 # ---------------------------------------------------------------------------
 # 3. Wrapper constructors — QGIS 4.x calling convention
@@ -141,6 +158,55 @@ except ImportError as e:
     print(f"  SKIP  (QGIS not on PYTHONPATH: {e})")
 
 # ---------------------------------------------------------------------------
+# 3b. Bundled bilateral filter
+# ---------------------------------------------------------------------------
+
+print("\n--- 3b. Bundled bilateral filter ---")
+
+def test_bilateral_import():
+    from simpli_bilateral import bilateral_filter  # noqa: F401
+
+def test_bilateral_edge_preservation():
+    """Bilateral filter must preserve a sharp edge better than Gaussian."""
+    import numpy as np
+    from simpli_bilateral import bilateral_filter
+    from scipy.ndimage import gaussian_filter
+
+    # Sharp step: left half = 0, right half = 1 (simulates bunker lip)
+    data = np.zeros((64, 64), dtype=np.float32)
+    data[:, 32:] = 1.0
+
+    gauss_result    = gaussian_filter(data, sigma=3.0)
+    bilateral_result = bilateral_filter(data, filter_size=13,
+                                        sigma_space=4.0, sigma_color=0.1)
+
+    # Measure edge sharpness: std of a vertical slice through the edge
+    gauss_edge     = gauss_result[:, 28:36].std()
+    bilateral_edge = bilateral_result[:, 28:36].std()
+
+    assert bilateral_edge > gauss_edge, (
+        f"Bilateral edge std ({bilateral_edge:.4f}) should be sharper "
+        f"than Gaussian ({gauss_edge:.4f})"
+    )
+
+def test_bilateral_slope_smoothing():
+    """Bilateral must smooth a continuous slope (no sharp edges)."""
+    import numpy as np
+    from simpli_bilateral import bilateral_filter
+
+    # Gentle ramp with noise — simulates fairway slope
+    ramp = np.tile(np.linspace(0, 1, 64, dtype=np.float32), (64, 1))
+    noisy = ramp + np.random.default_rng(42).normal(0, 0.02, ramp.shape).astype(np.float32)
+    result = bilateral_filter(noisy, filter_size=9, sigma_space=3.0, sigma_color=0.5)
+
+    # Result must be smoother than input (lower gradient variance)
+    assert result.std() < noisy.std(), "Bilateral must reduce noise on a smooth slope"
+
+test("bilateral filter module imports",                      test_bilateral_import)
+test("bilateral preserves sharp edges (bunker lip)",         test_bilateral_edge_preservation)
+test("bilateral smooths gentle slopes (fairway noise)",      test_bilateral_slope_smoothing)
+
+# ---------------------------------------------------------------------------
 # 4. Resolution string parser
 # ---------------------------------------------------------------------------
 
@@ -188,16 +254,42 @@ def test_tile_overlap():
     from simpli_neighbors_algorithm import _build_tiles
     overlap = 8
     for t in _build_tiles(200, 200, 64, overlap):
-        # left edge
         if t["dst_c0"] > 0:
             assert t["src_c0"] <= t["dst_c0"] - overlap
-        # top edge
         if t["dst_r0"] > 0:
             assert t["src_r0"] <= t["dst_r0"] - overlap
+
+def test_two_pass_output():
+    """Two-pass result must differ from median-only on a ramp (no terracing)."""
+    import numpy as np
+    from simpli_neighbors_algorithm import _filter_tile, MODE_TWO_PASS, MODE_MEDIAN
+    # Create a gentle linear ramp — pure median will terrace it
+    ramp = np.tile(np.linspace(0, 10, 64, dtype=np.float32), (64, 1))
+    result_median   = _filter_tile(ramp, filter_size=13, mode=MODE_MEDIAN,    gaussian_sigma=1.5)
+    result_two_pass = _filter_tile(ramp, filter_size=13, mode=MODE_TWO_PASS,  gaussian_sigma=1.5)
+    # Two-pass should be smoother: lower std-dev of the gradient
+    grad_median    = np.abs(np.diff(result_median,   axis=1)).std()
+    grad_two_pass  = np.abs(np.diff(result_two_pass, axis=1)).std()
+    assert grad_two_pass < grad_median, (
+        f"Two-pass gradient std ({grad_two_pass:.4f}) should be "
+        f"less than median-only ({grad_median:.4f})"
+    )
+
+def test_filter_tile_modes():
+    """All three modes must return float32 arrays of the same shape as input."""
+    import numpy as np
+    from simpli_neighbors_algorithm import _filter_tile, MODE_TWO_PASS, MODE_MEDIAN, MODE_BILATERAL
+    data = np.random.rand(64, 64).astype(np.float32) * 100
+    for mode in (MODE_TWO_PASS, MODE_MEDIAN, MODE_BILATERAL):
+        result = _filter_tile(data, filter_size=7, mode=mode, gaussian_sigma=1.5)
+        assert result.shape == data.shape, f"Mode {mode}: shape mismatch"
+        assert result.dtype == np.float32, f"Mode {mode}: not float32"
 
 test("tile count matches ceil(rows/size) * ceil(cols/size)", test_tile_count)
 test("every pixel covered exactly once",                     test_tile_coverage)
 test("src tiles extend by overlap beyond dst",               test_tile_overlap)
+test("two-pass is smoother than median-only on a ramp",      test_two_pass_output)
+test("all three filter modes return correct shape/dtype",    test_filter_tile_modes)
 
 # ---------------------------------------------------------------------------
 # 6. PyQt6 enum usage in widget file
