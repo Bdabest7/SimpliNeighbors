@@ -2,41 +2,39 @@
 # Copyright (C) 2024 SimpliFly
 # SPDX-License-Identifier: AGPL-3.0-or-later
 #
-# Custom parameter widget replicating the Pix4D Survey DSM "Surface smoothing"
-# panel: a Low–High slider paired with a spinbox, labelled
-# "Median filter radius (px)".
+# Custom parameter widgets:
+#   SmoothingWidget       — radius slider + spinbox  (Pix4D-style)
+#   CoresWidget           — CPU cores slider + spinbox
+#   ResolutionWidget      — Default / Custom toggle + value input
 
 from __future__ import annotations
+
+import os
 
 from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtGui import QFont
 from qgis.PyQt.QtWidgets import (
+    QButtonGroup,
+    QDoubleSpinBox,
     QHBoxLayout,
     QLabel,
+    QPushButton,
     QSlider,
     QSpinBox,
     QVBoxLayout,
     QWidget,
 )
+from qgis.core import QgsProcessingContext, QgsProcessingParameterDefinition
 from qgis.gui import QgsAbstractProcessingParameterWidgetWrapper
-from qgis.core import (
-    QgsProcessingParameterNumber,
-    QgsProcessingContext,
-    QgsProcessingParameterDefinition,
-)
 
-RADIUS_MIN = 1
-RADIUS_MAX = 50
-RADIUS_DEFAULT = 6
+_CPU_COUNT = os.cpu_count() or 1
 
 # ---------------------------------------------------------------------------
-# QSS — dark theme matching Pix4D Survey panel style
+# Shared QSS — dark theme matching Pix4D Survey panel
 # ---------------------------------------------------------------------------
 _QSS = """
-QWidget#SmoothingWidget {
-    background-color: #2b2b2b;
-    border-radius: 4px;
-    padding: 6px;
+QWidget {
+    background-color: transparent;
 }
 QLabel#headerLabel {
     color: #cccccc;
@@ -69,148 +67,315 @@ QSlider::sub-page:horizontal {
     background: #4a90d9;
     border-radius: 2px;
 }
-QSpinBox {
+QSpinBox, QDoubleSpinBox {
     background-color: #3c3c3c;
     color: #cccccc;
     border: 1px solid #555555;
     border-radius: 3px;
     padding: 2px 4px;
     font-size: 12px;
-    min-width: 44px;
-    max-width: 52px;
+    min-width: 48px;
+    max-width: 58px;
 }
-QSpinBox::up-button, QSpinBox::down-button {
+QSpinBox::up-button, QSpinBox::down-button,
+QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
     width: 0px;
+}
+QPushButton#modeBtn {
+    background-color: #3c3c3c;
+    color: #888888;
+    border: 1px solid #555555;
+    border-radius: 3px;
+    padding: 3px 10px;
+    font-size: 11px;
+    min-width: 60px;
+}
+QPushButton#modeBtn:checked {
+    background-color: #4a90d9;
+    color: #ffffff;
+    border: 1px solid #4a90d9;
 }
 """
 
 
-class SmoothingWidget(QWidget):
-    """
-    Standalone widget:
+# ---------------------------------------------------------------------------
+# Shared slider + spinbox row builder
+# ---------------------------------------------------------------------------
 
-        Surface smoothing
-        [ Low ══════●═══════════ High ]  [ 6 ]
-               Median filter radius (px)
+def _make_slider_row(
+    parent: QWidget,
+    minimum: int,
+    maximum: int,
+    default: int,
+    subtitle: str,
+    header: str,
+) -> tuple[QWidget, QSlider, QSpinBox]:
+    """
+    Build the standard Pix4D-style slider row and return
+    (container_widget, slider, spinbox).
+    """
+    container = QWidget(parent)
+    container.setStyleSheet(_QSS)
+    root = QVBoxLayout(container)
+    root.setContentsMargins(0, 4, 0, 4)
+    root.setSpacing(3)
+
+    hdr = QLabel(header)
+    hdr.setObjectName("headerLabel")
+    bold = QFont()
+    bold.setBold(True)
+    hdr.setFont(bold)
+    root.addWidget(hdr)
+
+    row = QHBoxLayout()
+    row.setSpacing(6)
+
+    low_lbl = QLabel("Low")
+    low_lbl.setObjectName("lowLabel")
+    low_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
+    slider = QSlider(Qt.Horizontal)
+    slider.setMinimum(minimum)
+    slider.setMaximum(maximum)
+    slider.setValue(default)
+    slider.setTickPosition(QSlider.TicksBelow)
+    slider.setTickInterval(max(1, (maximum - minimum) // 10))
+
+    high_lbl = QLabel("High")
+    high_lbl.setObjectName("highLabel")
+    high_lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+
+    spinbox = QSpinBox()
+    spinbox.setMinimum(minimum)
+    spinbox.setMaximum(maximum)
+    spinbox.setValue(default)
+    spinbox.setAlignment(Qt.AlignCenter)
+
+    row.addWidget(low_lbl)
+    row.addWidget(slider, stretch=1)
+    row.addWidget(high_lbl)
+    row.addWidget(spinbox)
+    root.addLayout(row)
+
+    sub = QLabel(subtitle)
+    sub.setObjectName("subtitleLabel")
+    sub.setAlignment(Qt.AlignCenter)
+    root.addWidget(sub)
+
+    # bidirectional sync
+    def _slider_changed(v: int) -> None:
+        if spinbox.value() != v:
+            spinbox.blockSignals(True)
+            spinbox.setValue(v)
+            spinbox.blockSignals(False)
+
+    def _spinbox_changed(v: int) -> None:
+        if slider.value() != v:
+            slider.blockSignals(True)
+            slider.setValue(v)
+            slider.blockSignals(False)
+
+    slider.valueChanged.connect(_slider_changed)
+    spinbox.valueChanged.connect(_spinbox_changed)
+
+    return container, slider, spinbox
+
+
+# ---------------------------------------------------------------------------
+# SmoothingWidget — radius slider
+# ---------------------------------------------------------------------------
+
+class SmoothingWidget(QWidget):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._container, self._slider, self._spinbox = _make_slider_row(
+            self,
+            minimum=1, maximum=50, default=6,
+            header="Surface smoothing",
+            subtitle="Median filter radius (px)",
+        )
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self._container)
+
+    def value(self) -> int:
+        return self._spinbox.value()
+
+    def setValue(self, v: int) -> None:
+        self._spinbox.setValue(max(1, min(50, int(v))))
+
+
+# ---------------------------------------------------------------------------
+# CoresWidget — CPU cores slider
+# ---------------------------------------------------------------------------
+
+class CoresWidget(QWidget):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._container, self._slider, self._spinbox = _make_slider_row(
+            self,
+            minimum=1, maximum=_CPU_COUNT, default=_CPU_COUNT,
+            header="CPU cores",
+            subtitle=f"Parallel threads  (detected: {_CPU_COUNT})",
+        )
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self._container)
+
+    def value(self) -> int:
+        return self._spinbox.value()
+
+    def setValue(self, v: int) -> None:
+        self._spinbox.setValue(max(1, min(_CPU_COUNT, int(v))))
+
+
+# ---------------------------------------------------------------------------
+# ResolutionWidget — Default / Custom toggle
+# ---------------------------------------------------------------------------
+
+class ResolutionWidget(QWidget):
+    """
+    Output resolution  [ Default ]  [ Custom ]    [ 0.0040 ]
+                       map units/px
     """
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setObjectName("SmoothingWidget")
         self.setStyleSheet(_QSS)
         self._build_ui()
-        self._connect_signals()
-
-    # ------------------------------------------------------------------
-    # UI construction
-    # ------------------------------------------------------------------
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
-        root.setContentsMargins(8, 8, 8, 8)
-        root.setSpacing(4)
+        root.setContentsMargins(0, 4, 0, 4)
+        root.setSpacing(3)
 
-        # Section header
-        header = QLabel("Surface smoothing")
-        header.setObjectName("headerLabel")
+        hdr = QLabel("Output resolution")
+        hdr.setObjectName("headerLabel")
         bold = QFont()
         bold.setBold(True)
-        header.setFont(bold)
-        root.addWidget(header)
+        hdr.setFont(bold)
+        root.addWidget(hdr)
 
-        # Slider row:  Low  [====slider====]  High  [spinbox]
-        slider_row = QHBoxLayout()
-        slider_row.setSpacing(6)
+        row = QHBoxLayout()
+        row.setSpacing(6)
 
-        low_lbl = QLabel("Low")
-        low_lbl.setObjectName("lowLabel")
-        low_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self._btn_default = QPushButton("Default")
+        self._btn_default.setObjectName("modeBtn")
+        self._btn_default.setCheckable(True)
+        self._btn_default.setChecked(True)
 
-        self.slider = QSlider(Qt.Horizontal)
-        self.slider.setMinimum(RADIUS_MIN)
-        self.slider.setMaximum(RADIUS_MAX)
-        self.slider.setValue(RADIUS_DEFAULT)
-        self.slider.setTickPosition(QSlider.TicksBelow)
-        self.slider.setTickInterval(5)
+        self._btn_custom = QPushButton("Custom")
+        self._btn_custom.setObjectName("modeBtn")
+        self._btn_custom.setCheckable(True)
 
-        high_lbl = QLabel("High")
-        high_lbl.setObjectName("highLabel")
-        high_lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self._group = QButtonGroup(self)
+        self._group.setExclusive(True)
+        self._group.addButton(self._btn_default)
+        self._group.addButton(self._btn_custom)
 
-        self.spinbox = QSpinBox()
-        self.spinbox.setMinimum(RADIUS_MIN)
-        self.spinbox.setMaximum(RADIUS_MAX)
-        self.spinbox.setValue(RADIUS_DEFAULT)
-        self.spinbox.setAlignment(Qt.AlignCenter)
+        self._value_input = QDoubleSpinBox()
+        self._value_input.setMinimum(0.0001)
+        self._value_input.setMaximum(9999.0)
+        self._value_input.setDecimals(4)
+        self._value_input.setValue(1.0)
+        self._value_input.setAlignment(Qt.AlignCenter)
+        self._value_input.setEnabled(False)
 
-        slider_row.addWidget(low_lbl)
-        slider_row.addWidget(self.slider, stretch=1)
-        slider_row.addWidget(high_lbl)
-        slider_row.addWidget(self.spinbox)
+        row.addWidget(self._btn_default)
+        row.addWidget(self._btn_custom)
+        row.addWidget(self._value_input)
+        row.addStretch()
+        root.addLayout(row)
 
-        root.addLayout(slider_row)
+        sub = QLabel("map units/px  (applies before filtering)")
+        sub.setObjectName("subtitleLabel")
+        root.addWidget(sub)
 
-        # Subtitle
-        subtitle = QLabel("Median filter radius (px)")
-        subtitle.setObjectName("subtitleLabel")
-        subtitle.setAlignment(Qt.AlignCenter)
-        root.addWidget(subtitle)
+        self._btn_default.toggled.connect(self._on_mode_changed)
 
-    def _connect_signals(self) -> None:
-        self.slider.valueChanged.connect(self._on_slider_changed)
-        self.spinbox.valueChanged.connect(self._on_spinbox_changed)
+    def _on_mode_changed(self, default_checked: bool) -> None:
+        self._value_input.setEnabled(not default_checked)
 
     # ------------------------------------------------------------------
-    # Synchronisation
+    # Value API — stores "default" or float-as-string
     # ------------------------------------------------------------------
 
-    def _on_slider_changed(self, value: int) -> None:
-        if self.spinbox.value() != value:
-            self.spinbox.blockSignals(True)
-            self.spinbox.setValue(value)
-            self.spinbox.blockSignals(False)
+    def value(self) -> str:
+        if self._btn_default.isChecked():
+            return "default"
+        return str(self._value_input.value())
 
-    def _on_spinbox_changed(self, value: int) -> None:
-        if self.slider.value() != value:
-            self.slider.blockSignals(True)
-            self.slider.setValue(value)
-            self.slider.blockSignals(False)
-
-    # ------------------------------------------------------------------
-    # Value API
-    # ------------------------------------------------------------------
-
-    def value(self) -> int:
-        return self.spinbox.value()
-
-    def setValue(self, v: int) -> None:
-        self.spinbox.setValue(max(RADIUS_MIN, min(RADIUS_MAX, int(v))))
+    def setValue(self, v: str) -> None:
+        v = str(v).strip().lower()
+        if v in ("", "default"):
+            self._btn_default.setChecked(True)
+        else:
+            try:
+                self._value_input.setValue(float(v))
+                self._btn_custom.setChecked(True)
+            except ValueError:
+                self._btn_default.setChecked(True)
 
 
 # ---------------------------------------------------------------------------
-# QGIS Processing widget wrapper
+# Processing wrapper classes
 # ---------------------------------------------------------------------------
 
 class SimpliNeighborsRadiusWrapper(QgsAbstractProcessingParameterWidgetWrapper):
-    """
-    Wraps SmoothingWidget as a Processing parameter widget for the RADIUS
-    parameter, so it renders inside the standard Processing algorithm dialog.
-    """
-
     def __init__(self, parameter: QgsProcessingParameterDefinition,
                  dialog_type, parent: QWidget | None = None) -> None:
         super().__init__(parameter, dialog_type, parent)
 
     def createWidget(self) -> QWidget:
         self._widget = SmoothingWidget()
-        default = self.parameterDefinition().defaultValue()
-        if default is not None:
-            self._widget.setValue(int(default))
+        d = self.parameterDefinition().defaultValue()
+        if d is not None:
+            self._widget.setValue(int(d))
         return self._widget
 
     def setWidgetValue(self, value, context: QgsProcessingContext) -> None:
         if value is not None:
             self._widget.setValue(int(value))
+
+    def widgetValue(self):
+        return self._widget.value()
+
+
+class SimpliNeighborsCoresWrapper(QgsAbstractProcessingParameterWidgetWrapper):
+    def __init__(self, parameter: QgsProcessingParameterDefinition,
+                 dialog_type, parent: QWidget | None = None) -> None:
+        super().__init__(parameter, dialog_type, parent)
+
+    def createWidget(self) -> QWidget:
+        self._widget = CoresWidget()
+        d = self.parameterDefinition().defaultValue()
+        if d is not None:
+            self._widget.setValue(int(d))
+        return self._widget
+
+    def setWidgetValue(self, value, context: QgsProcessingContext) -> None:
+        if value is not None:
+            self._widget.setValue(int(value))
+
+    def widgetValue(self):
+        return self._widget.value()
+
+
+class SimpliNeighborsResolutionWrapper(QgsAbstractProcessingParameterWidgetWrapper):
+    def __init__(self, parameter: QgsProcessingParameterDefinition,
+                 dialog_type, parent: QWidget | None = None) -> None:
+        super().__init__(parameter, dialog_type, parent)
+
+    def createWidget(self) -> QWidget:
+        self._widget = ResolutionWidget()
+        d = self.parameterDefinition().defaultValue()
+        if d is not None:
+            self._widget.setValue(str(d))
+        return self._widget
+
+    def setWidgetValue(self, value, context: QgsProcessingContext) -> None:
+        if value is not None:
+            self._widget.setValue(str(value))
 
     def widgetValue(self):
         return self._widget.value()
