@@ -1,0 +1,15 @@
+[general]
+name=SimpliNeighbors
+qgisMinimumVersion=4.0
+qgisMaximumVersion=4.99
+description=Fast DSM surface smoothing using median filter (r.neighbors equivalent)
+about=Applies a parallel tiled median filter to raster layers. Replicates the r.neighbors median method with maximum CPU utilization via multiprocessing. Designed as a crash-free, high-performance replacement for the built-in GRASS r.neighbors plugin. UI inspired by Pix4D Survey DSM surface smoothing.
+version=1.0.0
+author=SimpliFly
+email=
+repository=https://github.com/SimpliFly/SimpliNeighbors
+tracker=https://github.com/SimpliFly/SimpliNeighbors/issues
+tags=raster,smoothing,filter,DSM,median,neighbors,surface,GRASS
+category=Raster
+icon=
+hasProcessingProvider=yes
