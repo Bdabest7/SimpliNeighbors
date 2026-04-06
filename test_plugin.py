@@ -207,6 +207,55 @@ test("bilateral preserves sharp edges (bunker lip)",         test_bilateral_edge
 test("bilateral smooths gentle slopes (fairway noise)",      test_bilateral_slope_smoothing)
 
 # ---------------------------------------------------------------------------
+# 3c. Backend detection and dispatch
+# ---------------------------------------------------------------------------
+
+print("\n--- 3c. Backend detection ---")
+
+def test_backend_detection():
+    from simpli_bilateral import get_bilateral_backend
+    backend = get_bilateral_backend()
+    assert backend in ("CUDA", "Numba CPU", "NumPy"), f"Unknown backend: {backend}"
+    print(f"         Active backend: {backend}")
+
+def test_backend_cached():
+    """Second call must return same result (cached)."""
+    from simpli_bilateral import get_bilateral_backend
+    b1 = get_bilateral_backend()
+    b2 = get_bilateral_backend()
+    assert b1 == b2, "Backend changed between calls"
+
+def test_numba_cpu_matches_numpy():
+    """Numba CPU result must match NumPy within float32 tolerance."""
+    import numpy as np
+    try:
+        from simpli_bilateral_numba import bilateral_filter_numba_cpu, _NUMBA_OK
+        if not _NUMBA_OK:
+            print("         SKIP — numba not installed")
+            return
+    except ImportError:
+        print("         SKIP — numba not installed")
+        return
+    from simpli_bilateral import _bilateral_numpy
+    data = np.random.default_rng(7).random((64, 64)).astype(np.float32) * 10
+    r_numba = bilateral_filter_numba_cpu(data, filter_size=9, sigma_space=3.0, sigma_color=0.5)
+    r_numpy = _bilateral_numpy(data, filter_size=9, sigma_space=3.0, sigma_color=0.5)
+    assert np.allclose(r_numba, r_numpy, atol=1e-3), (
+        f"Max diff: {np.abs(r_numba - r_numpy).max():.6f} — fastmath divergence too large"
+    )
+
+def test_cuda_available_flag():
+    """_CUDA_OK must be a bool (True only on machines with a CUDA-capable GPU)."""
+    from simpli_bilateral_numba import _CUDA_OK
+    assert isinstance(_CUDA_OK, bool), f"_CUDA_OK is {type(_CUDA_OK)}, expected bool"
+    print(f"         CUDA available: {_CUDA_OK}")
+
+test("backend detection returns valid string",        test_backend_detection)
+test("backend result is cached (stable)",             test_backend_cached)
+test("Numba CPU matches NumPy within atol=1e-3",      test_numba_cpu_matches_numpy)
+test("_CUDA_OK flag is a bool",                       test_cuda_available_flag)
+
+# ---------------------------------------------------------------------------
 # 4. Resolution string parser
 # ---------------------------------------------------------------------------
 

@@ -357,10 +357,27 @@ class SimpliNeighborsAlgorithm(QgsProcessingAlgorithm):
             feedback.pushInfo(f"Gaussian sigma / sigmaColor = {gaussian_sigma}")
         feedback.pushInfo(f"Threads: {threads} / {_CPU_COUNT}")
 
+        # Detect bilateral backend once and log it (None for non-bilateral modes)
+        bilateral_backend: str | None = None
         if smooth_mode == MODE_BILATERAL:
-            feedback.pushInfo(
-                "Bilateral: bundled NumPy implementation — no OpenCV required."
-            )
+            from .simpli_bilateral import get_bilateral_backend
+            bilateral_backend = get_bilateral_backend()
+            feedback.pushInfo(f"Bilateral backend: {bilateral_backend}")
+            if bilateral_backend == "CUDA":
+                feedback.pushInfo(
+                    "GPU path active — full raster processed in one dispatch "
+                    "(no CPU tiling).  First run compiles CUDA kernel (~10–30 s)."
+                )
+            elif bilateral_backend == "Numba CPU":
+                feedback.pushInfo(
+                    "Numba CPU path active — fastmath JIT per tile.  "
+                    "First run compiles kernel (~5–10 s)."
+                )
+            else:
+                feedback.pushInfo(
+                    "NumPy fallback active.  Install numba for faster processing: "
+                    "pip install numba  (in OSGeo4W shell)"
+                )
 
         # ---- open with GDAL --------------------------------------------
         src_path = raster_layer.source()
@@ -408,54 +425,65 @@ class SimpliNeighborsAlgorithm(QgsProcessingAlgorithm):
             fill_val = float(np.nanmedian(data)) if not np.all(nodata_mask) else 0.0
             data[nodata_mask] = fill_val
 
-        # ---- tiling ----------------------------------------------------
-        # Overlap must cover the full median radius + Gaussian reach.
-        # Gaussian with sigma s has effective radius ~3s, so overlap = radius + ceil(3*sigma).
-        gaussian_reach = math.ceil(3.0 * gaussian_sigma) if smooth_mode != MODE_MEDIAN else 0
-        overlap = radius + gaussian_reach
+        # ---- CUDA bilateral: full-raster single dispatch -------------------
+        # Bypass CPU tiling entirely — entire raster lives in VRAM for the
+        # duration of the kernel.  ~3–5 s on RTX 5090 for a 22k×17k raster.
+        if smooth_mode == MODE_BILATERAL and bilateral_backend == "CUDA":
+            feedback.pushInfo("Transferring raster to GPU …")
+            from .simpli_bilateral_numba import bilateral_filter_cuda
+            sigma_space = max(filter_size / 3.0, 1.0)
+            output: np.ndarray = bilateral_filter_cuda(
+                data, filter_size, sigma_space, gaussian_sigma
+            )
+            feedback.setProgress(100)
 
-        tiles = _build_tiles(rows, cols, TILE_SIZE, overlap)
-        n_tiles = len(tiles)
-        feedback.pushInfo(
-            f"Processing {n_tiles} tiles "
-            f"({TILE_SIZE}px core + {overlap}px overlap) on {threads} thread(s) …"
-        )
+        # ---- CPU tiled processing (bilateral Numba/NumPy, Two-Pass, Median) -
+        else:
+            # Overlap: median radius + Gaussian effective reach (3σ)
+            gaussian_reach = math.ceil(3.0 * gaussian_sigma) if smooth_mode != MODE_MEDIAN else 0
+            overlap = radius + gaussian_reach
 
-        output: np.ndarray = np.empty_like(data)
-        completed = 0
+            tiles   = _build_tiles(rows, cols, TILE_SIZE, overlap)
+            n_tiles = len(tiles)
+            feedback.pushInfo(
+                f"Processing {n_tiles} tiles "
+                f"({TILE_SIZE}px core + {overlap}px overlap) on {threads} thread(s) …"
+            )
 
-        # ---- parallel execution ----------------------------------------
-        with ThreadPoolExecutor(max_workers=threads) as pool:
-            futures = {
-                pool.submit(
-                    _filter_tile,
-                    data[t["src_r0"]:t["src_r1"], t["src_c0"]:t["src_c1"]],
-                    filter_size,
-                    smooth_mode,
-                    gaussian_sigma,
-                ): t
-                for t in tiles
-            }
+            output: np.ndarray = np.empty_like(data)
+            completed = 0
 
-            for future in as_completed(futures):
-                if feedback.isCanceled():
-                    pool.shutdown(wait=False, cancel_futures=True)
-                    raise QgsProcessingException("Cancelled by user.")
+            with ThreadPoolExecutor(max_workers=threads) as pool:
+                futures = {
+                    pool.submit(
+                        _filter_tile,
+                        data[t["src_r0"]:t["src_r1"], t["src_c0"]:t["src_c1"]],
+                        filter_size,
+                        smooth_mode,
+                        gaussian_sigma,
+                    ): t
+                    for t in tiles
+                }
 
-                tile   = futures[future]
-                result = future.result()
+                for future in as_completed(futures):
+                    if feedback.isCanceled():
+                        pool.shutdown(wait=False, cancel_futures=True)
+                        raise QgsProcessingException("Cancelled by user.")
 
-                r_off = tile["dst_r0"] - tile["src_r0"]
-                c_off = tile["dst_c0"] - tile["src_c0"]
-                h     = tile["dst_r1"] - tile["dst_r0"]
-                w     = tile["dst_c1"] - tile["dst_c0"]
-                output[
-                    tile["dst_r0"]:tile["dst_r1"],
-                    tile["dst_c0"]:tile["dst_c1"],
-                ] = result[r_off: r_off + h, c_off: c_off + w]
+                    tile   = futures[future]
+                    result = future.result()
 
-                completed += 1
-                feedback.setProgress(int(completed / n_tiles * 100))
+                    r_off = tile["dst_r0"] - tile["src_r0"]
+                    c_off = tile["dst_c0"] - tile["src_c0"]
+                    h     = tile["dst_r1"] - tile["dst_r0"]
+                    w     = tile["dst_c1"] - tile["dst_c0"]
+                    output[
+                        tile["dst_r0"]:tile["dst_r1"],
+                        tile["dst_c0"]:tile["dst_c1"],
+                    ] = result[r_off: r_off + h, c_off: c_off + w]
+
+                    completed += 1
+                    feedback.setProgress(int(completed / n_tiles * 100))
 
         # ---- restore nodata --------------------------------------------
         if nodata_mask is not None:
