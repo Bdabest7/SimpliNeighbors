@@ -11,9 +11,13 @@ class SimpliNeighborsPlugin:
         self.iface = iface
         self.provider = None
 
-    def initGui(self):
+    def initProcessing(self):
+        # qgis_process calls only this; desktop QGIS calls initGui.
         self.provider = SimpliNeighborsProvider()
         QgsApplication.processingRegistry().addProvider(self.provider)
+
+    def initGui(self):
+        self.initProcessing()
 
     def unload(self):
         if self.provider:
