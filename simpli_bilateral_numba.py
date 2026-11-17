@@ -21,6 +21,7 @@
 from __future__ import annotations
 import math
 import os
+import re
 import sys
 import numpy as np
 
@@ -73,24 +74,93 @@ NUMBA_CACHE_DIR = _set_numba_cache_dir()
 # We also inject into PATH and call os.add_dll_directory() as belt+suspenders.
 # ---------------------------------------------------------------------------
 
+def _cuda_disabled() -> bool:
+    """SIMPLINEIGHBORS_CUDA=0 (or off/false/no) turns the CUDA path off entirely:
+    no toolkit discovery, no PATH changes, no CUDA probing (finding 12)."""
+    return os.environ.get("SIMPLINEIGHBORS_CUDA", "").strip().lower() in ("0", "off", "false", "no")
+
+
+def _program_files_roots() -> list:
+    r"""Real paths of the folders a CUDA toolkit may be loaded from.
+
+    The fixed C:\Program Files, plus ProgramW6432 / ProgramFiles when they
+    really are a folder called 'Program Files' directly under a drive root, so
+    a tampered environment variable cannot add an arbitrary folder.
+    """
+    cands = [r"C:\Program Files"]
+    for var in ("ProgramW6432", "ProgramFiles"):
+        p = os.environ.get(var, "")
+        if not p:
+            continue
+        p = os.path.normpath(p)
+        drive, tail = os.path.splitdrive(p)
+        if os.path.basename(p).lower() == "program files" and os.path.dirname(p) == drive + os.sep:
+            cands.append(p)
+    roots = []
+    for c in cands:
+        if os.path.isdir(c):
+            r = os.path.normcase(os.path.realpath(c))
+            if r not in roots:
+                roots.append(r)
+    return roots
+
+
+def _is_trusted_cuda_dir(path: str) -> bool:
+    """True if path (links and junctions resolved) is inside Program Files."""
+    try:
+        real = os.path.normcase(os.path.realpath(path))
+        for root in _program_files_roots():
+            if os.path.commonpath([real, root]) == root:
+                return True
+    except (ValueError, OSError):
+        pass
+    return False
+
+
+def _version_key(name: str):
+    """'v13.2' -> (13, 2), so v9.0 sorts below v12.8 and v13.2 (not as strings)."""
+    nums = re.findall(r"\d+", name)
+    return tuple(int(n) for n in nums)
+
+
+CUDA_NOTES: list = []   # what discovery decided, for the algorithm's log
+
+
 def _find_cuda_root() -> str:
-    """Return the CUDA toolkit root directory, or '' if not found."""
+    """Return the CUDA toolkit root directory, or '' if not found.
+
+    Only folders under Program Files are accepted, from CUDA_PATH / CUDA_HOME
+    or from the standard install location (newest version by number).
+    """
     # 1. CUDA_PATH env var (set by CUDA installer, QGIS usually preserves it)
     for var in ("CUDA_PATH", "CUDA_HOME"):
         p = os.environ.get(var, "")
-        if p and os.path.isdir(p):
+        if not p:
+            continue
+        if not os.path.isdir(p):
+            CUDA_NOTES.append(f"{var}={p} ignored: not a folder")
+        elif not _is_trusted_cuda_dir(p):
+            CUDA_NOTES.append(f"{var}={p} ignored: not under Program Files")
+        elif not os.path.isdir(os.path.join(p, "nvvm")):
+            CUDA_NOTES.append(f"{var}={p} ignored: no nvvm folder, not a CUDA toolkit")
+        else:
             return p
 
-    # 2. Scan common install location
-    prog = os.environ.get("ProgramFiles", r"C:\Program Files")
-    toolkit = os.path.join(prog, "NVIDIA GPU Computing Toolkit", "CUDA")
-    if os.path.isdir(toolkit):
+    # 2. Scan the standard install location, newest version first (numeric order)
+    for root in _program_files_roots():
+        toolkit = os.path.join(root, "NVIDIA GPU Computing Toolkit", "CUDA")
+        if not os.path.isdir(toolkit):
+            continue
         versions = sorted(
-            (d for d in os.listdir(toolkit) if os.path.isdir(os.path.join(toolkit, d))),
+            (d for d in os.listdir(toolkit)
+             if re.fullmatch(r"v\d+(\.\d+)*", d) and os.path.isdir(os.path.join(toolkit, d))),
+            key=_version_key,
             reverse=True,
         )
-        if versions:
-            return os.path.join(toolkit, versions[0])
+        for v in versions:
+            cand = os.path.join(toolkit, v)
+            if os.path.isdir(os.path.join(cand, "nvvm")) and _is_trusted_cuda_dir(cand):
+                return cand
     return ""
 
 
@@ -115,8 +185,11 @@ def _find_nvvm_dll(cuda_root: str) -> str:
     return candidates[0] if candidates else ""
 
 
-if sys.platform == "win32":
+CUDA_ROOT = ""
+CUDA_DISABLED = _cuda_disabled()
+if sys.platform == "win32" and not CUDA_DISABLED:
     _cuda_root = _find_cuda_root()
+    CUDA_ROOT = _cuda_root
 
     if _cuda_root:
         # --- Set CUDA_HOME so numba can derive NVVM + libdevice paths ---
@@ -149,7 +222,8 @@ if sys.platform == "win32":
                 except (OSError, AttributeError):
                     pass
         if _dirs_to_add:
-            os.environ["PATH"] = ";".join(_dirs_to_add) + ";" + _current_path
+            # Appended, not prepended: a CUDA folder must never shadow system DLLs.
+            os.environ["PATH"] = _current_path + ";" + ";".join(_dirs_to_add)
 
 # ---------------------------------------------------------------------------
 # Availability detection (done once at import time)
@@ -172,8 +246,8 @@ except ImportError:
 # directory components BEFORE anything calls get_cuda_paths() (which caches).
 # ---------------------------------------------------------------------------
 
-if _NUMBA_OK and sys.platform == "win32":
-    _nvvm_dll_path = globals().get("_nvvm_dll", "") or _find_nvvm_dll(_find_cuda_root())
+if _NUMBA_OK and sys.platform == "win32" and not _cuda_disabled():
+    _nvvm_dll_path = globals().get("_nvvm_dll", "")
 
     if _nvvm_dll_path:
         try:
@@ -195,7 +269,7 @@ if _NUMBA_OK and sys.platform == "win32":
         except Exception:
             pass
 
-if _NUMBA_OK:
+if _NUMBA_OK and not _cuda_disabled():
     try:
         from numba import cuda as _cuda
         _CUDA_OK = _cuda.is_available()

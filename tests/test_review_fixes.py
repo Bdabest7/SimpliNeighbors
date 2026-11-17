@@ -176,5 +176,53 @@ class Finding9NumbaCacheTests(unittest.TestCase):
             plugin_dir = os.path.join(self.PLUGINS, 'SimpliNeighbors')
             self.assertFalse(os.path.normcase(out[1]).startswith(os.path.normcase(plugin_dir)))
 
+
+
+class Finding12CudaPathTests(unittest.TestCase):
+    PLUGINS = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+    def setUp(self):
+        from .. import simpli_bilateral_numba as m
+        self.m = m
+        m.CUDA_NOTES.clear()
+
+    def test_version_sorting_is_numeric(self):
+        names = ['v9.0', 'v12.8', 'v13.2', 'v10.1']
+        self.assertEqual(sorted(names, key=self.m._version_key, reverse=True)[:2], ['v13.2', 'v12.8'])
+        self.assertEqual(sorted(names, reverse=True)[0], 'v9.0')  # what a string sort did
+
+    def test_cuda_path_outside_program_files_is_ignored(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, 'nvvm'))
+            with mock.patch.dict(os.environ, {'CUDA_PATH': d}):
+                root = self.m._find_cuda_root()
+            self.assertNotEqual(os.path.normcase(root), os.path.normcase(d))
+            self.assertTrue(any('not under Program Files' in n for n in self.m.CUDA_NOTES))
+
+    def test_fake_program_files_env_cannot_add_a_root(self):
+        with tempfile.TemporaryDirectory() as d:
+            evil = os.path.join(d, 'Evil')
+            os.makedirs(os.path.join(evil, 'nvvm'))
+            with mock.patch.dict(os.environ, {'ProgramFiles': evil, 'ProgramW6432': evil, 'CUDA_PATH': evil}):
+                self.assertFalse(self.m._is_trusted_cuda_dir(evil))
+                self.assertNotEqual(os.path.normcase(self.m._find_cuda_root()), os.path.normcase(evil))
+
+    def test_trusted_program_files_path(self):
+        self.assertTrue(self.m._is_trusted_cuda_dir(r'C:\Program Files\NVIDIA GPU Computing Toolkit'))
+        self.assertFalse(self.m._is_trusted_cuda_dir(r'C:\Program Files (x86)\x'))
+        self.assertFalse(self.m._is_trusted_cuda_dir(r'C:\Users'))
+
+    def test_cuda_off_switch_in_fresh_interpreter(self):
+        import subprocess
+        import sys
+        code = ("import os\n"
+                "from SimpliNeighbors import simpli_bilateral_numba as m\n"
+                "print(m.CUDA_DISABLED, m._CUDA_OK, repr(m.CUDA_ROOT), m._NUMBA_OK)\n")
+        env = dict(os.environ, SIMPLINEIGHBORS_CUDA='0', PYTHONPATH=self.PLUGINS)
+        r = subprocess.run([sys.executable, '-c', code], env=env, capture_output=True, text=True,
+                           cwd=tempfile.gettempdir(), timeout=300)
+        self.assertEqual(r.returncode, 0, r.stderr[-600:])
+        self.assertEqual(r.stdout.split()[:3], ['True', 'False', "''"])
+
 if __name__ == '__main__':
     unittest.main()
