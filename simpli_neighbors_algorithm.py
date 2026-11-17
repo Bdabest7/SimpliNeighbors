@@ -579,28 +579,18 @@ class SimpliNeighborsAlgorithm(QgsProcessingAlgorithm):
         if nodata_mask is not None:
             output[nodata_mask] = float(nodata)
 
-        # ---- write GeoTIFF ---------------------------------------------
+        # ---- write GeoTIFF (to <output>.partial, renamed when complete) ---
         feedback.pushInfo(f"Writing output: {output_path}")
-        driver: gdal.Driver = gdal.GetDriverByName("GTiff")
-        out_ds: gdal.Dataset = driver.Create(
-            output_path, cols, rows, 1, gdal.GDT_Float32,
-            options=[
-                "COMPRESS=LZW", "PREDICTOR=2",
-                "TILED=YES", "BLOCKXSIZE=512", "BLOCKYSIZE=512",
-                "BIGTIFF=IF_SAFER",
-            ],
-        )
-        if out_ds is None:
-            raise QgsProcessingException(f"Could not create: {output_path}")
-
-        out_ds.SetGeoTransform(geotransform)
-        out_ds.SetProjection(projection)
-        out_band: gdal.Band = out_ds.GetRasterBand(1)
-        if nodata is not None:
-            out_band.SetNoDataValue(float(nodata))
-        out_band.WriteArray(output)
-        out_band.FlushCache()
-        out_ds = None
+        out = AtomicGeoTiff(output_path, cols, rows, geotransform, projection, nodata)
+        try:
+            out.write(output)
+            out.commit()
+        except BaseException:
+            out.abandon()
+            feedback.reportError(
+                f"Output not complete. The unfinished file {out.partial_path} was left; "
+                f"{output_path} was not replaced.")
+            raise
 
         feedback.pushInfo("Done.")
         return {self.OUTPUT: output_path}
@@ -756,3 +746,57 @@ def _gdal_exceptions():
                 m.UseExceptions()
             else:
                 m.DontUseExceptions()
+
+
+class AtomicGeoTiff:
+    """Write the output GeoTIFF to '<output>.partial' and move it to the real
+    name only when it is complete (finding 4).
+
+    A cancelled, failed or killed run leaves at most '<output>.partial' (never
+    deleted by the plugin, rewritten by the next run of the same job); nothing
+    at the output path looks complete unless it is. An older file at the output
+    path is replaced only by the finished one.
+    """
+
+    CREATION_OPTIONS = [
+        "COMPRESS=LZW", "PREDICTOR=2",
+        "TILED=YES", "BLOCKXSIZE=512", "BLOCKYSIZE=512",
+        "BIGTIFF=IF_SAFER",
+    ]
+
+    def __init__(self, output_path: str, cols: int, rows: int, geotransform,
+                 projection: str, nodata):
+        self.output_path = output_path
+        self.partial_path = output_path + ".partial"
+        driver: gdal.Driver = gdal.GetDriverByName("GTiff")
+        self._ds = driver.Create(
+            self.partial_path, cols, rows, 1, gdal.GDT_Float32,
+            options=self.CREATION_OPTIONS,
+        )
+        if self._ds is None:
+            raise QgsProcessingException(f"Could not create: {self.partial_path}")
+        self._ds.SetGeoTransform(geotransform)
+        self._ds.SetProjection(projection)
+        self._band: gdal.Band = self._ds.GetRasterBand(1)
+        if nodata is not None:
+            self._band.SetNoDataValue(float(nodata))
+
+    def write(self, array: np.ndarray, yoff: int = 0) -> None:
+        self._band.WriteArray(array, 0, yoff)
+
+    def commit(self) -> None:
+        """Close the partial file and move it to the output path."""
+        self._band.FlushCache()
+        self._band = None
+        self._ds = None  # closes and flushes the file
+        try:
+            os.replace(self.partial_path, self.output_path)
+        except OSError as e:
+            raise QgsProcessingException(
+                f"The result is complete in {self.partial_path} but could not be moved to "
+                f"{self.output_path} (is the old file open in another program?): {e}")
+
+    def abandon(self) -> None:
+        """Close the partial file after a failure; it is left on disk, incomplete."""
+        self._band = None
+        self._ds = None

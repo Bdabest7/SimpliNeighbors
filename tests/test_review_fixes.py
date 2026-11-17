@@ -397,5 +397,50 @@ class Finding15GdalSettingsTests(unittest.TestCase):
                            capture_output=True, text=True, cwd=tempfile.gettempdir(), timeout=300)
         self.assertIn(r.stdout.strip().splitlines()[-1], ('0', 'False'), r.stderr[-400:])
 
+
+
+class Finding4AtomicOutputTests(unittest.TestCase):
+    GT = (0.0, 0.5, 0.0, 10.0, 0.0, -0.5)
+
+    def _make(self, d):
+        return alg.AtomicGeoTiff(os.path.join(d, 'out.tif'), 64, 64, self.GT, '', -32767)
+
+    def test_success_replaces_output_and_leaves_no_partial(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = self._make(d)
+            self.assertFalse(os.path.exists(os.path.join(d, 'out.tif')))  # nothing there while writing
+            out.write(np.full((64, 64), 5, dtype=np.float32))
+            self.assertFalse(os.path.exists(os.path.join(d, 'out.tif')))
+            out.commit()
+            self.assertTrue(os.path.exists(os.path.join(d, 'out.tif')))
+            self.assertFalse(os.path.exists(os.path.join(d, 'out.tif.partial')))
+            ds = gdal.Open(os.path.join(d, 'out.tif'))
+            self.assertEqual(float(ds.GetRasterBand(1).ReadAsArray()[3, 3]), 5.0)
+            self.assertEqual(ds.GetRasterBand(1).GetNoDataValue(), -32767)
+            ds = None
+
+    def test_failure_leaves_no_output_and_keeps_old_one(self):
+        with tempfile.TemporaryDirectory() as d:
+            old = os.path.join(d, 'out.tif')
+            open(old, 'wb').write(b'old complete result')
+            out = self._make(d)
+            out.write(np.zeros((32, 64), dtype=np.float32), 0)   # half the rows only
+            out.abandon()                                         # run failed here
+            self.assertEqual(open(old, 'rb').read(), b'old complete result')
+            self.assertTrue(os.path.exists(old + '.partial'))     # kept, clearly incomplete
+
+    def test_fresh_failure_leaves_nothing_at_output_path(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = self._make(d)
+            out.write(np.zeros((32, 64), dtype=np.float32), 0)
+            out.abandon()
+            self.assertFalse(os.path.exists(os.path.join(d, 'out.tif')))
+
+    def test_algorithm_wraps_write_in_atomic_writer(self):
+        with open(alg.__file__, encoding='utf-8') as f:
+            src = f.read()
+        self.assertIn('AtomicGeoTiff(output_path', src)
+        self.assertNotIn('driver.Create(\n            output_path', src)
+
 if __name__ == '__main__':
     unittest.main()
