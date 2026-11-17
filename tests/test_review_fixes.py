@@ -6,6 +6,7 @@ r"""Tests for the 2026-10-13 review fixes (run with QGIS's Python, from the plug
 Separate from ../test_plugin.py, which is a flat-import script (three of its
 tests fail at 5893055 with 'attempted relative import', unrelated to these fixes).
 """
+import math
 import os
 import tempfile
 import unittest
@@ -441,6 +442,106 @@ class Finding4AtomicOutputTests(unittest.TestCase):
             src = f.read()
         self.assertIn('AtomicGeoTiff(output_path', src)
         self.assertNotIn('driver.Create(\n            output_path', src)
+
+
+
+class Finding5And10BandTests(unittest.TestCase):
+    def test_fill_value_matches_nanmedian_exactly(self):
+        rng = np.random.default_rng(11)
+        for n_rows, n_cols, nodata_share, nan_share in [(300, 257, 0.2, 0.0), (301, 256, 0.3, 0.01),
+                                                         (64, 64, 0.0, 0.05), (50, 50, 0.6, 0.0),
+                                                         (257, 100, 0.001, 0.0)]:
+            a = (rng.random((n_rows, n_cols)) * 40 + 120).astype(np.float32)
+            a[rng.random(a.shape) < nodata_share] = -32767.0
+            a[rng.random(a.shape) < nan_share] = np.nan
+            a[0, 0] = -0.0
+            mask = np.isnan(a) | (a == np.float32(-32767.0))
+            if mask.any() and not mask.all():
+                expect = float(np.nanmedian(a))
+            elif mask.all():
+                expect = 0.0
+            else:
+                expect = None
+            got = alg._global_fill_value(lambda r0, r1: a[r0:r1], n_rows, -32767.0, stripe=37)
+            self.assertEqual(got, expect, (n_rows, n_cols, nodata_share, nan_share))
+
+    def test_fill_value_odd_and_even_counts_and_negatives(self):
+        for vals in ([5, 1, 3], [5, 1, 3, 9], [-4.5, 2.25, -0.5, -32767.0, 7.75, -32767.0], [1, -32767.0]):
+            a = np.array(vals, dtype=np.float32).reshape(1, -1)
+            mask = a == np.float32(-32767.0)
+            if not mask.any():
+                continue
+            self.assertEqual(alg._global_fill_value(lambda r0, r1: a[r0:r1], 1, -32767.0, stripe=1),
+                             float(np.nanmedian(a)))
+
+    def test_all_nodata_gives_zero_and_none_gives_none(self):
+        a = np.full((10, 10), -32767.0, dtype=np.float32)
+        self.assertEqual(alg._global_fill_value(lambda r0, r1: a[r0:r1], 10, -32767.0), 0.0)
+        b = np.ones((10, 10), dtype=np.float32)
+        self.assertIsNone(alg._global_fill_value(lambda r0, r1: b[r0:r1], 10, -32767.0))
+
+    def test_band_plan_covers_every_row_once_on_the_tile_grid(self):
+        for rows in (1, 511, 512, 513, 5000, 12164):
+            for core in (512, 1024, 2560):
+                bands = alg._plan_bands(rows, core, 20)
+                covered = []
+                for b in bands:
+                    self.assertEqual(b['r0'] % alg.TILE_SIZE, 0)
+                    self.assertLessEqual(b['s0'], b['r0'])
+                    self.assertGreaterEqual(b['s1'], b['r1'])
+                    self.assertGreaterEqual(b['r0'] - b['s0'], min(20, b['r0']))
+                    covered.extend(range(b['r0'], b['r1']))
+                self.assertEqual(covered, list(range(rows)))
+
+    def test_band_rows_are_multiples_of_tile_size_and_cuda_launch_is_bounded(self):
+        for cols in (100, 5000, 25314, 100000):
+            for fs in (3, 33, 101):
+                for cuda in (True, False):
+                    r = alg._band_core_rows(cols, fs, cuda)
+                    self.assertEqual(r % alg.TILE_SIZE, 0)
+                    self.assertGreaterEqual(r, alg.TILE_SIZE)
+        # the Jackson CC DTM (25314 wide) with Brenton's radius 16 (window 33) on CUDA
+        self.assertLessEqual(alg._band_core_rows(25314, 33, True) * 25314 * 33 * 33, 1.6e11)
+
+    def test_banded_filtering_equals_whole_raster_for_every_mode(self):
+        """Core of the finding: bands with overlap give the same pixels as one pass."""
+        from .. import simpli_bilateral as sb
+        rng = np.random.default_rng(5)
+        rows, cols = 1800, 700
+        yy = np.linspace(0, 6, rows)[:, None]
+        data = (130 + 2 * np.sin(yy) + rng.random((rows, cols)) * 0.15).astype(np.float32)
+        data[700:760, 100:300] += 1.0  # a lip
+        for mode, radius, sigma in [(alg.MODE_MEDIAN, 4, 1.0), (alg.MODE_TWO_PASS, 5, 1.5),
+                                    (alg.MODE_BILATERAL, 6, 0.1)]:
+            fs = 2 * radius + 1
+            reach = math.ceil(3.0 * sigma) if mode != alg.MODE_MEDIAN else 0
+            overlap = radius + reach
+            tiles = alg._build_tiles(rows, cols, alg.TILE_SIZE, overlap)
+            whole = np.empty_like(data)
+            alg._filter_tiles(data, whole, tiles, fs, mode, sigma, 4, Feedback(), backend='NumPy')
+            banded = np.empty_like(data)
+            for b in alg._plan_bands(rows, 512, overlap):
+                chunk = data[b['s0']:b['s1']]
+                res = np.empty_like(chunk)
+                alg._filter_tiles(chunk, res, alg._tiles_for_band(tiles, b), fs, mode, sigma, 4,
+                                  Feedback(), backend='NumPy')
+                banded[b['r0']:b['r1']] = res[b['r0'] - b['s0']:b['r1'] - b['s0']]
+            self.assertTrue(np.array_equal(whole, banded), f"mode {mode}")
+
+    def test_cuda_banded_equals_whole_when_available(self):
+        from .. import simpli_bilateral_numba as nb
+        if not nb._CUDA_OK:
+            self.skipTest('no CUDA here')
+        rng = np.random.default_rng(6)
+        rows, cols, radius = 1600, 600, 8
+        data = (130 + rng.random((rows, cols)) * 0.3).astype(np.float32)
+        fs = 2 * radius + 1
+        whole = nb.bilateral_filter_cuda(data, fs, fs / 3.0, 0.1)
+        banded = np.empty_like(data)
+        for b in alg._plan_bands(rows, 512, radius):
+            res = nb.bilateral_filter_cuda(data[b['s0']:b['s1']], fs, fs / 3.0, 0.1)
+            banded[b['r0']:b['r1']] = res[b['r0'] - b['s0']:b['r1'] - b['s0']]
+        self.assertTrue(np.array_equal(whole, banded))
 
 if __name__ == '__main__':
     unittest.main()

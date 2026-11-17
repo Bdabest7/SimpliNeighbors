@@ -462,7 +462,7 @@ class SimpliNeighborsAlgorithm(QgsProcessingAlgorithm):
             feedback.pushInfo(f"Backend details: {_sb.describe_backend(bilateral_backend)}")
             if bilateral_backend == "CUDA":
                 feedback.pushInfo(
-                    "GPU path active — full raster processed in one dispatch "
+                    "GPU path active — one dispatch per row band "
                     "(no CPU tiling).  First run compiles CUDA kernel (~10–30 s)."
                 )
             elif bilateral_backend == "Numba CPU":
@@ -533,57 +533,75 @@ class SimpliNeighborsAlgorithm(QgsProcessingAlgorithm):
             f"Raster size: {cols} × {rows} px  |  pixel size: {pixel_size:.6g} map units"
         )
 
-        # ---- read into float32 -----------------------------------------
-        feedback.pushInfo("Reading raster data …")
-        data: np.ndarray = band.ReadAsArray().astype(np.float32)
-        ds = None
-
-        nodata_mask: np.ndarray | None = None
-        if nodata is not None:
-            nodata_mask = np.isnan(data) | (data == float(nodata))
-            fill_val = float(np.nanmedian(data)) if not np.all(nodata_mask) else 0.0
-            data[nodata_mask] = fill_val
-
-        # ---- CUDA bilateral: full-raster single dispatch -------------------
-        # Bypass CPU tiling entirely — entire raster lives in VRAM for the
-        # duration of the kernel.  ~3–5 s on RTX 5090 for a 22k×17k raster.
-        if smooth_mode == MODE_BILATERAL and bilateral_backend == "CUDA":
-            feedback.pushInfo("Transferring raster to GPU …")
-            from .simpli_bilateral_numba import bilateral_filter_cuda
-            sigma_space = max(filter_size / 3.0, 1.0)
-            output: np.ndarray = bilateral_filter_cuda(
-                data, filter_size, sigma_space, gaussian_sigma
-            )
-            feedback.setProgress(100)
-
-        # ---- CPU tiled processing (bilateral Numba/NumPy, Two-Pass, Median) -
+        # ---- plan the row bands (findings 5 and 10) ----------------------
+        use_cuda = smooth_mode == MODE_BILATERAL and bilateral_backend == "CUDA"
+        sigma_space = max(filter_size / 3.0, 1.0)
+        if use_cuda:
+            overlap = filter_size // 2          # the kernel's reach
+            tiles_all = None
         else:
             # Overlap: median radius + Gaussian effective reach (3σ)
             gaussian_reach = math.ceil(3.0 * gaussian_sigma) if smooth_mode != MODE_MEDIAN else 0
             overlap = radius + gaussian_reach
+            tiles_all = _build_tiles(rows, cols, TILE_SIZE, overlap)
+        core_rows = _band_core_rows(cols, filter_size, use_cuda)
+        bands = _plan_bands(rows, core_rows, overlap)
+        feedback.pushInfo(
+            f"Processing {len(bands)} row band(s) of up to {core_rows} rows "
+            f"(+{overlap} rows overlap each side)"
+            + ("" if use_cuda else f", {len(tiles_all)} tiles of {TILE_SIZE}px on {threads} thread(s)")
+            + " …"
+        )
 
-            tiles   = _build_tiles(rows, cols, TILE_SIZE, overlap)
-            n_tiles = len(tiles)
-            feedback.pushInfo(
-                f"Processing {n_tiles} tiles "
-                f"({TILE_SIZE}px core + {overlap}px overlap) on {threads} thread(s) …"
-            )
+        def read_rows(r0: int, r1: int) -> np.ndarray:
+            return band.ReadAsArray(0, r0, cols, r1 - r0).astype(np.float32)
 
-            output: np.ndarray = np.empty_like(data)
-            _filter_tiles(
-                data, output, tiles, filter_size, smooth_mode, gaussian_sigma,
-                threads, feedback, backend=bilateral_backend,
-            )
+        # ---- nodata: one global fill value, as before --------------------
+        fill_val = None
+        progress_start = 0
+        if nodata is not None:
+            feedback.pushInfo("Scanning for nodata …")
+            fill_val = _global_fill_value(read_rows, rows, float(nodata), feedback, 0, 15)
+            progress_start = 15
+            if fill_val is None:
+                feedback.pushInfo("No nodata pixels.")
+            else:
+                feedback.pushInfo(f"Nodata pixels are filled with {fill_val:.6g} while filtering "
+                                  f"and restored afterwards.")
 
-        # ---- restore nodata --------------------------------------------
-        if nodata_mask is not None:
-            output[nodata_mask] = float(nodata)
-
-        # ---- write GeoTIFF (to <output>.partial, renamed when complete) ---
-        feedback.pushInfo(f"Writing output: {output_path}")
+        # ---- filter band by band and write each core as soon as it is done
         out = AtomicGeoTiff(output_path, cols, rows, geotransform, projection, nodata)
+        feedback.pushInfo(f"Writing output: {output_path}")
         try:
-            out.write(output)
+            for i, b in enumerate(bands):
+                if feedback.isCanceled():
+                    raise QgsProcessingException("Cancelled by user.")
+                data = read_rows(b["s0"], b["s1"])
+                nodata_mask = None
+                if nodata is not None and fill_val is not None:
+                    nodata_mask = np.isnan(data) | (data == float(nodata))
+                    data[nodata_mask] = fill_val
+
+                if use_cuda:
+                    # One kernel launch per band: far below the 2 s GPU timeout.
+                    from .simpli_bilateral_numba import bilateral_filter_cuda
+                    result = bilateral_filter_cuda(data, filter_size, sigma_space, gaussian_sigma)
+                else:
+                    result = np.empty_like(data)
+                    _filter_tiles(
+                        data, result, _tiles_for_band(tiles_all, b), filter_size, smooth_mode,
+                        gaussian_sigma, threads, feedback, backend=bilateral_backend,
+                    )
+
+                lo, hi = b["r0"] - b["s0"], b["r1"] - b["s0"]
+                core = result[lo:hi]
+                if nodata_mask is not None:
+                    core[nodata_mask[lo:hi]] = float(nodata)
+                out.write(core, b["r0"])
+                del data, result, core, nodata_mask
+                feedback.pushInfo(f"  band {i + 1}/{len(bands)} done (rows {b['r0']}–{b['r1']})")
+                feedback.setProgress(progress_start + (100 - progress_start) * (i + 1) / len(bands))
+            ds = None
             out.commit()
         except BaseException:
             out.abandon()
@@ -800,3 +818,144 @@ class AtomicGeoTiff:
         """Close the partial file after a failure; it is left on disk, incomplete."""
         self._band = None
         self._ds = None
+
+
+# ---------------------------------------------------------------------------
+# Row bands (findings 5 and 10)
+#
+# The raster is processed in horizontal bands of whole 512-px tile rows. Each
+# band is read with `overlap` extra rows above and below, filtered, and only
+# its core rows are written. Because band boundaries fall on the tile grid and
+# the overlap is at least what each filter needs, every output pixel sees
+# exactly the same input as in a whole-raster run: the output is identical
+# (tested), but only one band is in memory instead of 4-6 copies of the raster,
+# progress is reported after every band, and a CUDA launch covers a band, not
+# the whole raster, so it stays far below Windows' 2 s GPU timeout.
+# ---------------------------------------------------------------------------
+
+_BAND_PIXELS_CPU = 2 ** 25      # about 134 MB of float32 per band core
+_BAND_PIXELS_CUDA = 2 ** 26
+_CUDA_TAPS_PER_LAUNCH = 1.5e11  # measured 300-900 Gtap/s on the RTX 5090: well under 1 s
+
+
+def _band_core_rows(cols: int, filter_size: int, cuda: bool) -> int:
+    """Core rows per band: a multiple of TILE_SIZE (override for tests and
+    tuning with SIMPLINEIGHBORS_BAND_ROWS)."""
+    raw = os.environ.get("SIMPLINEIGHBORS_BAND_ROWS", "").strip()
+    if raw:
+        try:
+            rows = int(raw)
+        except ValueError:
+            raise QgsProcessingException(f"SIMPLINEIGHBORS_BAND_ROWS is not an integer: {raw!r}")
+        if rows < 1:
+            raise QgsProcessingException("SIMPLINEIGHBORS_BAND_ROWS must be at least 1")
+    else:
+        rows = (_BAND_PIXELS_CUDA if cuda else _BAND_PIXELS_CPU) // max(cols, 1)
+        if cuda:
+            rows = min(rows, int(_CUDA_TAPS_PER_LAUNCH / (max(cols, 1) * filter_size * filter_size)))
+    return max(TILE_SIZE, (rows // TILE_SIZE) * TILE_SIZE)
+
+
+def _plan_bands(rows: int, core_rows: int, overlap: int) -> list[dict]:
+    """Bands as dicts: core rows [r0, r1) and the rows to read [s0, s1)."""
+    bands = []
+    for r0 in range(0, rows, core_rows):
+        r1 = min(r0 + core_rows, rows)
+        bands.append({"r0": r0, "r1": r1,
+                      "s0": max(r0 - overlap, 0), "s1": min(r1 + overlap, rows)})
+    return bands
+
+
+def _tiles_for_band(tiles: list[dict], band: dict) -> list[dict]:
+    """The global tiles whose core lies in the band, with rows relative to band['s0']."""
+    s0 = band["s0"]
+    out = []
+    for t in tiles:
+        if t["dst_r0"] >= band["r0"] and t["dst_r1"] <= band["r1"]:
+            u = dict(t)
+            for k in ("dst_r0", "dst_r1", "src_r0", "src_r1"):
+                u[k] = t[k] - s0
+            out.append(u)
+    return out
+
+
+def _float_keys(a: np.ndarray) -> np.ndarray:
+    """Map float32 values to uint32 keys that sort like the floats."""
+    u = np.ascontiguousarray(a, dtype=np.float32).view(np.uint32)
+    return np.where(u & np.uint32(0x80000000), ~u, u | np.uint32(0x80000000)).astype(np.uint32)
+
+
+def _keys_to_float(keys: np.ndarray) -> np.ndarray:
+    keys = np.asarray(keys, dtype=np.uint32)
+    u = np.where(keys & np.uint32(0x80000000), keys & np.uint32(0x7FFFFFFF), ~keys).astype(np.uint32)
+    return u.view(np.float32)
+
+
+def _global_fill_value(read_rows, rows: int, nodata: float, feedback=None,
+                       progress_lo: int = 0, progress_hi: int = 0, stripe: int = 1024):
+    """The value that replaces nodata pixels before filtering, computed exactly
+    as the whole-raster code did but without holding the raster.
+
+    The earlier code used np.nanmedian of the whole float32 array *including*
+    the nodata-valued pixels (only NaN was left out), and 0.0 when every pixel
+    is nodata/NaN. That is kept exactly, so results do not change. (It means a
+    large nodata share pulls the fill value down; see REVIEW-FIXES.md.)
+
+    The median is found exactly in two streaming passes: a 65,536-bin histogram
+    of the order-preserving float keys' top 16 bits, then the few values in the
+    bin(s) holding the middle rank.
+
+    read_rows(r0, r1) returns rows [r0, r1) as float32. Returns the fill value,
+    or None when no pixel is nodata/NaN (nothing to fill).
+    """
+    def stripes():
+        for r0 in range(0, rows, stripe):
+            yield r0, read_rows(r0, min(r0 + stripe, rows))
+
+    hist = np.zeros(65536, dtype=np.int64)
+    n_masked = 0
+    n_total = 0
+    n_stripes = max(1, math.ceil(rows / stripe))
+    done = 0
+    for _r0, a in stripes():
+        if feedback is not None and feedback.isCanceled():
+            raise QgsProcessingException("Cancelled by user.")
+        nan = np.isnan(a)
+        n_masked += int((nan | (a == nodata)).sum())
+        keys = _float_keys(a[~nan])
+        hist += np.bincount(keys >> np.uint32(16), minlength=65536)
+        n_total += a.size
+        done += 1
+        if feedback is not None and progress_hi > progress_lo:
+            feedback.setProgress(progress_lo + (progress_hi - progress_lo) * 0.5 * done / n_stripes)
+    if n_masked == 0:
+        return None
+    if n_masked == n_total:
+        return 0.0
+    n = int(hist.sum())  # non-NaN pixels
+    ranks = [(n - 1) // 2] if n % 2 else [n // 2 - 1, n // 2]
+    cum = np.cumsum(hist)
+    bins = {r: int(np.searchsorted(cum, r, side="right")) for r in ranks}
+    wanted = sorted(set(bins.values()))
+    collected = {b: [] for b in wanted}
+    done = 0
+    for _r0, a in stripes():
+        if feedback is not None and feedback.isCanceled():
+            raise QgsProcessingException("Cancelled by user.")
+        keys = _float_keys(a[~np.isnan(a)])
+        top = keys >> np.uint32(16)
+        for b in wanted:
+            sel = keys[top == np.uint32(b)]
+            if sel.size:
+                collected[b].append(sel)
+        done += 1
+        if feedback is not None and progress_hi > progress_lo:
+            feedback.setProgress(progress_lo + (progress_hi - progress_lo) * (0.5 + 0.5 * done / n_stripes))
+    vals = []
+    for r in ranks:
+        b = bins[r]
+        arr = np.sort(np.concatenate(collected[b]))
+        vals.append(float(_keys_to_float(arr[r - int(cum[b] - hist[b])])))
+    if len(vals) == 1:
+        return float(vals[0])
+    return float(np.mean(np.array(vals, dtype=np.float32)))  # what np.median does for two values
