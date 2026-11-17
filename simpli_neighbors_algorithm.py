@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import math
 import os
-import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
@@ -399,26 +398,26 @@ class SimpliNeighborsAlgorithm(QgsProcessingAlgorithm):
 
         # ---- open with GDAL --------------------------------------------
         src_path = raster_layer.source()
-
         target_res = _parse_resolution(res_str)
         if target_res is not None:
             feedback.pushInfo(f"Resampling to {target_res} map units/px …")
-            resampled = os.path.join(
-                tempfile.gettempdir(), "simplineighbors_resampled.tif"
-            )
-            gdal.Warp(
-                resampled, src_path,
+            # Resample into an in-memory dataset: no file at a fixed path in
+            # %TEMP% (concurrent runs collided on it and it was never removed),
+            # nothing to clean up, and it disappears with the run (finding 3).
+            ds: gdal.Dataset = gdal.Warp(
+                "", src_path,
                 options=gdal.WarpOptions(
+                    format="MEM",
                     xRes=target_res, yRes=target_res,
                     resampleAlg=gdal.GRA_Bilinear,
-                    creationOptions=["COMPRESS=LZW", "TILED=YES"],
                 ),
             )
-            src_path = resampled
-
-        ds: gdal.Dataset = gdal.Open(src_path, gdal.GA_ReadOnly)
-        if ds is None:
-            raise QgsProcessingException(f"GDAL could not open: {src_path}")
+            if ds is None:
+                raise QgsProcessingException(f"GDAL could not resample: {src_path}")
+        else:
+            ds: gdal.Dataset = gdal.Open(src_path, gdal.GA_ReadOnly)
+            if ds is None:
+                raise QgsProcessingException(f"GDAL could not open: {src_path}")
 
         band: gdal.Band = ds.GetRasterBand(1)
         cols: int       = ds.RasterXSize

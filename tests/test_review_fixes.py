@@ -56,5 +56,35 @@ class Finding2PresetTests(unittest.TestCase):
         self.assertEqual(alg.resolve_settings(p, 1), (True, None))
 
 
+
+
+class Finding3ResampleTests(unittest.TestCase):
+    def test_memory_warp_equals_file_warp(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, 'src.tif')
+            drv = gdal.GetDriverByName('GTiff')
+            ds = drv.Create(src, 300, 200, 1, gdal.GDT_Float32)
+            ds.SetGeoTransform((0, 0.05, 0, 10, 0, -0.05))
+            ds.GetRasterBand(1).SetNoDataValue(-32767)
+            ds.GetRasterBand(1).WriteArray(np.random.default_rng(3).random((200, 300)).astype(np.float32))
+            ds = None
+            old = os.path.join(d, 'old.tif')
+            w = gdal.Warp(old, src, options=gdal.WarpOptions(
+                xRes=0.08, yRes=0.08, resampleAlg=gdal.GRA_Bilinear,
+                creationOptions=['COMPRESS=LZW', 'TILED=YES']))
+            mem = gdal.Warp('', src, options=gdal.WarpOptions(
+                format='MEM', xRes=0.08, yRes=0.08, resampleAlg=gdal.GRA_Bilinear))
+            w = None  # flush and close
+            od = gdal.Open(old)
+            a = od.GetRasterBand(1).ReadAsArray()
+            od = None
+            b = mem.GetRasterBand(1).ReadAsArray()
+            self.assertTrue(np.array_equal(a, b))
+
+    def test_algorithm_source_has_no_fixed_temp_path(self):
+        with open(alg.__file__, encoding='utf-8') as f:
+            src = f.read()
+        self.assertNotIn('simplineighbors_resampled', src)
+
 if __name__ == '__main__':
     unittest.main()
