@@ -25,6 +25,41 @@ import sys
 import numpy as np
 
 # ---------------------------------------------------------------------------
+# Numba cache location — MUST happen before importing numba (finding 9)
+#
+# The CPU kernel is compiled with cache=True. Numba's on-disk cache is loaded
+# with pickle, and by default it lives in __pycache__ inside the plugin folder:
+# anyone who can write that folder could plant a cache that runs code in every
+# account that loads the plugin. Each account therefore gets its own cache
+# folder under its own profile (writable by that account only). An explicit
+# NUMBA_CACHE_DIR (the automation sets one per account) is respected.
+# ---------------------------------------------------------------------------
+
+def _default_numba_cache_dir() -> str:
+    base = os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), ".cache")
+    return os.path.join(base, "SimpliNeighbors", "numba-cache")
+
+
+def _set_numba_cache_dir() -> str:
+    path = os.environ.get("NUMBA_CACHE_DIR") or _default_numba_cache_dir()
+    path = os.path.abspath(path)
+    os.environ["NUMBA_CACHE_DIR"] = path
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError:
+        pass  # numba falls back to its own choice (and then caches nothing) if unusable
+    # If something else already imported numba, it read the env var too late.
+    if "numba" in sys.modules:
+        try:
+            sys.modules["numba"].config.CACHE_DIR = path
+        except Exception:
+            pass
+    return path
+
+
+NUMBA_CACHE_DIR = _set_numba_cache_dir()
+
+# ---------------------------------------------------------------------------
 # CUDA toolkit discovery — MUST happen before importing numba
 #
 # QGIS 4.x on Windows overrides the system PATH, so numba can't find the

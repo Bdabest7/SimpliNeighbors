@@ -133,5 +133,48 @@ class Finding7FailedTileTests(unittest.TestCase):
             self._run(fake, feedback=Feedback(cancel_after=1))
         self.assertLess(time.time() - t0, 3.0)
 
+
+
+class Finding9NumbaCacheTests(unittest.TestCase):
+    PLUGINS = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+    def _run(self, env_extra, remove=()):
+        import subprocess
+        import sys
+        code = (
+            "import os, sys\n"
+            "assert 'numba' not in sys.modules\n"
+            "from SimpliNeighbors import simpli_bilateral_numba as m\n"
+            "import numba\n"
+            "print(os.environ['NUMBA_CACHE_DIR'])\n"
+            "print(numba.config.CACHE_DIR)\n"
+            "print(m._cpu_kernel.stats if hasattr(m, '_cpu_kernel') else 'nokernel')\n"
+        )
+        env = dict(os.environ)
+        for k in remove:
+            env.pop(k, None)
+        env.update(env_extra)
+        env['PYTHONPATH'] = self.PLUGINS
+        r = subprocess.run([sys.executable, '-c', code], env=env, capture_output=True,
+                           text=True, cwd=tempfile.gettempdir(), timeout=300)
+        self.assertEqual(r.returncode, 0, r.stderr[-800:])
+        return r.stdout.strip().splitlines()
+
+    def test_default_is_per_account_under_localappdata_and_set_before_numba(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = self._run({'LOCALAPPDATA': d}, remove=('NUMBA_CACHE_DIR',))
+            want = os.path.join(d, 'SimpliNeighbors', 'numba-cache')
+            self.assertEqual(os.path.normcase(out[0]), os.path.normcase(want))
+            self.assertEqual(os.path.normcase(out[1]), os.path.normcase(want))
+            self.assertTrue(os.path.isdir(want))
+
+    def test_explicit_cache_dir_is_respected_and_plugin_folder_is_not_used(self):
+        with tempfile.TemporaryDirectory() as d:
+            custom = os.path.join(d, 'mine')
+            out = self._run({'NUMBA_CACHE_DIR': custom})
+            self.assertEqual(os.path.normcase(out[1]), os.path.normcase(custom))
+            plugin_dir = os.path.join(self.PLUGINS, 'SimpliNeighbors')
+            self.assertFalse(os.path.normcase(out[1]).startswith(os.path.normcase(plugin_dir)))
+
 if __name__ == '__main__':
     unittest.main()
