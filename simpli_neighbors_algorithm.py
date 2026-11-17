@@ -331,11 +331,29 @@ class SimpliNeighborsAlgorithm(QgsProcessingAlgorithm):
             raise QgsProcessingException("Invalid input raster layer.")
 
         preset_idx: int = self.parameterAsEnum(parameters, self.PRESET, context)
+        use_preset, preset_note = resolve_settings(parameters, preset_idx)
+        if preset_note:
+            feedback.pushWarning(preset_note)
 
-        if preset_idx != PRESET_CUSTOM:
+        if use_preset:
             # Preset overrides individual controls
             _, smooth_mode, radius, gaussian_sigma = PRESETS[preset_idx]
             feedback.pushInfo(f"Preset: {PRESET_OPTIONS[preset_idx]}")
+            # The dialog always sends the individual values too. Say so only
+            # when they differ from the preset, which then overrides them.
+            if parameters.get(self.PRESET) is not None:
+                given = {}
+                if parameters.get(self.SMOOTH_MODE) is not None:
+                    given["smoothing algorithm"] = (self.parameterAsEnum(parameters, self.SMOOTH_MODE, context), smooth_mode)
+                if parameters.get(self.RADIUS) is not None:
+                    given["radius"] = (self.parameterAsInt(parameters, self.RADIUS, context), radius)
+                if parameters.get(self.GAUSSIAN_SIGMA) is not None:
+                    given["gaussian sigma"] = (self.parameterAsDouble(parameters, self.GAUSSIAN_SIGMA, context), gaussian_sigma)
+                diff = [f"{k} {a} (preset: {b})" for k, (a, b) in given.items() if a != b]
+                if diff:
+                    feedback.pushWarning(
+                        "The preset overrides these explicit settings: " + "; ".join(diff) +
+                        ". Set Preset to Custom to use your own values.")
         else:
             smooth_mode: int      = self.parameterAsEnum(parameters, self.SMOOTH_MODE, context)
             radius: int           = self.parameterAsInt(parameters, self.RADIUS, context)
@@ -548,3 +566,27 @@ def _build_tiles(rows: int, cols: int, tile_size: int, overlap: int) -> list[dic
                 "src_c1": min(dst_c1 + overlap, cols),
             })
     return tiles
+
+
+def resolve_settings(parameters: dict, preset_idx: int) -> tuple[bool, str | None]:
+    """Decide whether the PRESET or the explicit mode/radius/sigma values apply.
+
+    Returns (use_preset, note). The note, if any, is for the log.
+
+    - PRESET passed (as the dialog and the automation always do): unchanged
+      from before. A non-Custom preset overrides the individual settings; if the
+      explicit values differ from the preset's, the log says so.
+    - PRESET not passed but SMOOTH_MODE / RADIUS / GAUSSIAN_SIGMA were: the
+      explicit values win (treated as Custom). Before, the PRESET default of 1
+      silently replaced them.
+    - Nothing passed: the default preset 1, as before.
+    """
+    explicit = [k for k in (SimpliNeighborsAlgorithm.SMOOTH_MODE,
+                            SimpliNeighborsAlgorithm.RADIUS,
+                            SimpliNeighborsAlgorithm.GAUSSIAN_SIGMA)
+                if parameters.get(k) is not None]
+    preset_given = parameters.get(SimpliNeighborsAlgorithm.PRESET) is not None
+    if not preset_given and explicit:
+        return False, ("PRESET was not given, so the explicit " + ", ".join(explicit) +
+                       " apply (Custom) instead of the default preset")
+    return preset_idx != PRESET_CUSTOM, None
