@@ -25,3 +25,6 @@ desktop.ini
 .idea/
 *.swp
 *.swo
+
+# Claude Code local settings
+.claude/
