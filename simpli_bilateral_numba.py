@@ -373,7 +373,7 @@ def bilateral_filter_cuda(
 # ---------------------------------------------------------------------------
 
 if _NUMBA_OK:
-    @numba.jit(nopython=True, fastmath=True, cache=True)
+    @numba.jit(nopython=True, fastmath=True, cache=True, nogil=True)
     def _cpu_kernel(data, padded, spatial_flat, inv_2_sc2, fs, h, w):
         """
         Numba JIT bilateral filter for a single tile.
@@ -381,6 +381,7 @@ if _NUMBA_OK:
         nopython  : no Python object overhead in the inner loop
         fastmath  : SVML approximate exp (~4× faster than libm), FMA
         cache     : compiled bytecode cached to disk — first call only is slow
+        nogil     : releases the GIL, so the tile threads really run in parallel
         NO parallel/prange: ThreadPoolExecutor already saturates all cores
                             at the tile level; adding prange would oversubscribe
         """

@@ -29,6 +29,7 @@ from qgis.core import (
     QgsProcessingContext,
     QgsProcessingException,
     QgsProcessingFeedback,
+    QgsProcessingParameterDefinition,
     QgsProcessingParameterNumber,
     QgsProcessingParameterEnum,
     QgsProcessingParameterRasterDestination,
@@ -90,6 +91,10 @@ PRESETS = [
 
 PRESET_OPTIONS = [p[0] for p in PRESETS]
 
+# Bilateral backend choice (advanced parameter; Auto = best available, as before)
+BACKEND_OPTIONS = ["Auto (best available)", "CUDA (GPU)", "Numba CPU", "NumPy"]
+BACKEND_OPTION_VALUES = ["auto", "cuda", "numba", "numpy"]
+
 
 # ---------------------------------------------------------------------------
 # Tile worker (called inside ThreadPoolExecutor — scipy/cv2 release the GIL)
@@ -100,6 +105,7 @@ def _filter_tile(
     filter_size: int,
     mode: int,
     gaussian_sigma: float,
+    backend: str | None = None,
 ) -> np.ndarray:
     """
     Apply the selected smoothing algorithm to one tile.
@@ -144,7 +150,8 @@ def _filter_tile(
         # sigma_color: elevation range — gaussian_sigma repurposed as map units
         return bilateral_filter(data, filter_size,
                                 sigma_space=sigma_space,
-                                sigma_color=gaussian_sigma)
+                                sigma_color=gaussian_sigma,
+                                backend=backend)
 
     # Two-Pass (default)
     from scipy.ndimage import median_filter, gaussian_filter
@@ -165,6 +172,7 @@ class SimpliNeighborsAlgorithm(QgsProcessingAlgorithm):
     GAUSSIAN_SIGMA = "GAUSSIAN_SIGMA"
     THREADS        = "THREADS"
     RESOLUTION     = "RESOLUTION"
+    BACKEND        = "BACKEND"
     OUTPUT         = "OUTPUT"
 
     # ------------------------------------------------------------------
@@ -306,6 +314,22 @@ class SimpliNeighborsAlgorithm(QgsProcessingAlgorithm):
             pass
         self.addParameter(res_param)
 
+        # BACKEND — advanced, so the dialog looks as before; the automation
+        # pins it so results do not depend on what an account happens to have.
+        backend_param = QgsProcessingParameterEnum(
+            self.BACKEND,
+            "Bilateral backend  [Bilateral mode only; a pinned backend that is missing is an error]",
+            options=BACKEND_OPTIONS,
+            defaultValue=0,
+        )
+        try:
+            backend_param.setFlags(
+                backend_param.flags() | QgsProcessingParameterDefinition.Flag.Advanced)
+        except AttributeError:  # QGIS 3 spelling
+            backend_param.setFlags(
+                backend_param.flags() | QgsProcessingParameterDefinition.FlagAdvanced)
+        self.addParameter(backend_param)
+
         self.addParameter(
             QgsProcessingParameterRasterDestination(
                 self.OUTPUT,
@@ -374,12 +398,29 @@ class SimpliNeighborsAlgorithm(QgsProcessingAlgorithm):
             feedback.pushInfo(f"Gaussian sigma / sigmaColor = {gaussian_sigma}")
         feedback.pushInfo(f"Threads: {threads} / {_CPU_COUNT}")
 
-        # Detect bilateral backend once and log it (None for non-bilateral modes)
+        # Choose the bilateral backend, honouring a pin, and log it (finding 8).
+        # The BACKEND parameter wins; when it is Auto, SIMPLINEIGHBORS_BACKEND
+        # may pin one. A pinned backend that is missing is an error.
         bilateral_backend: str | None = None
         if smooth_mode == MODE_BILATERAL:
-            from .simpli_bilateral import get_bilateral_backend
-            bilateral_backend = get_bilateral_backend()
-            feedback.pushInfo(f"Bilateral backend: {bilateral_backend}")
+            from . import simpli_bilateral as _sb
+            backend_idx = self.parameterAsEnum(parameters, self.BACKEND, context) \
+                if parameters.get(self.BACKEND) is not None else 0
+            requested = BACKEND_OPTION_VALUES[backend_idx]
+            source = "BACKEND parameter"
+            if requested == "auto" and os.environ.get("SIMPLINEIGHBORS_BACKEND", "").strip():
+                requested = os.environ["SIMPLINEIGHBORS_BACKEND"]
+                source = "SIMPLINEIGHBORS_BACKEND"
+            try:
+                bilateral_backend = _sb.resolve_backend(requested)
+            except _sb.BackendUnavailable as e:
+                raise QgsProcessingException(str(e))
+            pinned = _sb.normalize_backend_name(requested) is not None
+            feedback.pushInfo(
+                f"Bilateral backend: {bilateral_backend}"
+                + (f"  (pinned by {source})" if pinned else "  (auto-selected)")
+            )
+            feedback.pushInfo(f"Backend details: {_sb.describe_backend(bilateral_backend)}")
             if bilateral_backend == "CUDA":
                 feedback.pushInfo(
                     "GPU path active — full raster processed in one dispatch "
@@ -395,6 +436,8 @@ class SimpliNeighborsAlgorithm(QgsProcessingAlgorithm):
                     "NumPy fallback active.  Install numba for faster processing: "
                     "pip install numba  (in OSGeo4W shell)"
                 )
+        else:
+            feedback.pushInfo("Backend: scipy (only the Bilateral mode uses CUDA / Numba / NumPy)")
 
         # ---- open with GDAL --------------------------------------------
         src_path = raster_layer.source()
@@ -470,7 +513,7 @@ class SimpliNeighborsAlgorithm(QgsProcessingAlgorithm):
             output: np.ndarray = np.empty_like(data)
             _filter_tiles(
                 data, output, tiles, filter_size, smooth_mode, gaussian_sigma,
-                threads, feedback,
+                threads, feedback, backend=bilateral_backend,
             )
 
         # ---- restore nodata --------------------------------------------
@@ -571,6 +614,7 @@ def _filter_tiles(
     gaussian_sigma: float,
     threads: int,
     feedback,
+    backend: str | None = None,
 ) -> None:
     """Filter every tile of `data` on a thread pool and copy the cores into `output`."""
     n_tiles = len(tiles)
@@ -583,6 +627,7 @@ def _filter_tiles(
                 filter_size,
                 smooth_mode,
                 gaussian_sigma,
+                backend,
             ): t
             for t in tiles
         }

@@ -224,5 +224,62 @@ class Finding12CudaPathTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr[-600:])
         self.assertEqual(r.stdout.split()[:3], ['True', 'False', "''"])
 
+
+
+class Finding8BackendTests(unittest.TestCase):
+    def setUp(self):
+        from .. import simpli_bilateral as sb
+        self.sb = sb
+
+    def test_auto_and_pins(self):
+        self.assertIn(self.sb.resolve_backend(None), ('CUDA', 'Numba CPU', 'NumPy'))
+        self.assertEqual(self.sb.resolve_backend('numpy'), 'NumPy')
+        self.assertEqual(self.sb.resolve_backend('auto'), self.sb.get_bilateral_backend())
+
+    def test_unknown_name_is_rejected(self):
+        with self.assertRaises(self.sb.BackendUnavailable):
+            self.sb.resolve_backend('opencl')
+
+    def test_missing_cuda_fails_instead_of_falling_back(self):
+        from .. import simpli_bilateral_numba as nb
+        with mock.patch.object(nb, '_CUDA_OK', False):
+            with self.assertRaises(self.sb.BackendUnavailable):
+                self.sb.resolve_backend('cuda')
+
+    def test_cuda_switched_off_fails_when_pinned(self):
+        from .. import simpli_bilateral_numba as nb
+        with mock.patch.object(nb, 'CUDA_DISABLED', True):
+            with self.assertRaises(self.sb.BackendUnavailable):
+                self.sb.resolve_backend('cuda')
+
+    def test_missing_numba_fails_instead_of_falling_back(self):
+        from .. import simpli_bilateral_numba as nb
+        with mock.patch.object(nb, '_NUMBA_OK', False):
+            with self.assertRaises(self.sb.BackendUnavailable):
+                self.sb.resolve_backend('numba')
+
+    def test_kernel_is_nogil(self):
+        from .. import simpli_bilateral_numba as nb
+        if not nb._NUMBA_OK:
+            self.skipTest('numba not installed')
+        self.assertTrue(nb._cpu_kernel.targetoptions.get('nogil'))
+
+    def test_pinned_backends_agree(self):
+        rng = np.random.default_rng(7)
+        data = (rng.random((64, 64)) * 0.2).astype(np.float32)
+        a = self.sb.bilateral_filter(data, 7, 2.0, 0.1, backend='NumPy')
+        from .. import simpli_bilateral_numba as nb
+        if nb._NUMBA_OK:
+            b = self.sb.bilateral_filter(data, 7, 2.0, 0.1, backend='Numba CPU')
+            self.assertLess(float(np.abs(a - b).max()), 1e-3)
+
+    def test_parameter_exists_and_is_advanced(self):
+        a = alg.SimpliNeighborsAlgorithm()
+        a.initAlgorithm()
+        p = a.parameterDefinition('BACKEND')
+        self.assertIsNotNone(p)
+        self.assertTrue(p.flags() & alg.QgsProcessingParameterDefinition.Flag.Advanced)
+        self.assertEqual(p.defaultValue(), 0)
+
 if __name__ == '__main__':
     unittest.main()
