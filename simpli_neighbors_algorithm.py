@@ -41,6 +41,12 @@ gdal.UseExceptions()
 
 TILE_SIZE = 512  # px — good L2/L3 cache footprint per thread
 _CPU_COUNT = os.cpu_count() or 1
+# THREADS is bounded by sanity, not by this machine: the same saved parameters
+# (e.g. THREADS=64) must be accepted on a machine with fewer cores too.
+MAX_THREADS = 1024
+# Upper limit of 512 px tiles in one run (about 26 gigapixels); raise with
+# SIMPLINEIGHBORS_MAX_TILES. The Jackson CC DTM is about 1,200 tiles.
+DEFAULT_MAX_TILES = 100_000
 
 # Enum indices for SMOOTH_MODE
 MODE_TWO_PASS  = 0
@@ -287,7 +293,7 @@ class SimpliNeighborsAlgorithm(QgsProcessingAlgorithm):
             type=QgsProcessingParameterNumber.Integer,
             defaultValue=_CPU_COUNT,
             minValue=1,
-            maxValue=_CPU_COUNT,
+            maxValue=MAX_THREADS,
         )
         try:
             from .simpli_neighbors_widget import SimpliNeighborsCoresWrapper
@@ -340,6 +346,14 @@ class SimpliNeighborsAlgorithm(QgsProcessingAlgorithm):
     # ------------------------------------------------------------------
     # Execution
     # ------------------------------------------------------------------
+    def checkParameterValues(self, parameters, context):
+        # Catch an unreadable RESOLUTION before anything runs (finding 13)
+        try:
+            _parse_resolution(self.parameterAsString(parameters, self.RESOLUTION, context))
+        except ValueError as e:
+            return False, str(e)
+        return super().checkParameterValues(parameters, context)
+
 
     def processAlgorithm(
         self,
@@ -350,7 +364,7 @@ class SimpliNeighborsAlgorithm(QgsProcessingAlgorithm):
 
         # ---- parameters ------------------------------------------------
         raster_layer = self.parameterAsRasterLayer(parameters, self.INPUT, context)
-        if raster_layer is None:
+        if raster_layer is None or not raster_layer.isValid():
             raise QgsProcessingException("Invalid input raster layer.")
 
         preset_idx: int = self.parameterAsEnum(parameters, self.PRESET, context)
@@ -397,6 +411,9 @@ class SimpliNeighborsAlgorithm(QgsProcessingAlgorithm):
         if smooth_mode in (MODE_TWO_PASS, MODE_BILATERAL):
             feedback.pushInfo(f"Gaussian sigma / sigmaColor = {gaussian_sigma}")
         feedback.pushInfo(f"Threads: {threads} / {_CPU_COUNT}")
+        if threads > _CPU_COUNT:
+            feedback.pushWarning(
+                f"{threads} threads requested but this machine has {_CPU_COUNT} cores")
 
         # Choose the bilateral backend, honouring a pin, and log it (finding 8).
         # The BACKEND parameter wins; when it is Auto, SIMPLINEIGHBORS_BACKEND
@@ -441,7 +458,10 @@ class SimpliNeighborsAlgorithm(QgsProcessingAlgorithm):
 
         # ---- open with GDAL --------------------------------------------
         src_path = raster_layer.source()
-        target_res = _parse_resolution(res_str)
+        try:
+            target_res = _parse_resolution(res_str)
+        except ValueError as e:
+            raise QgsProcessingException(str(e))
         if target_res is not None:
             feedback.pushInfo(f"Resampling to {target_res} map units/px …")
             # Resample into an in-memory dataset: no file at a fixed path in
@@ -469,6 +489,23 @@ class SimpliNeighborsAlgorithm(QgsProcessingAlgorithm):
         projection      = ds.GetProjection()
         nodata          = band.GetNoDataValue()
         pixel_size      = abs(geotransform[1])
+
+        # ---- sanity limits (finding 13) -------------------------------
+        if cols < 1 or rows < 1:
+            raise QgsProcessingException(f"Input raster has no pixels ({cols} x {rows})")
+        n_tiles_total = math.ceil(rows / TILE_SIZE) * math.ceil(cols / TILE_SIZE)
+        max_tiles = _max_tiles()
+        if n_tiles_total > max_tiles:
+            raise QgsProcessingException(
+                f"{n_tiles_total} tiles of {TILE_SIZE} px needed ({cols} x {rows} px), more "
+                f"than the limit of {max_tiles} per run. Check the input and the output "
+                f"resolution (the limit can be raised with SIMPLINEIGHBORS_MAX_TILES)."
+            )
+        if filter_size > min(rows, cols):
+            raise QgsProcessingException(
+                f"Filter window {filter_size} x {filter_size} px is larger than the raster "
+                f"({cols} x {rows} px); lower the radius"
+            )
 
         feedback.pushInfo(
             f"Raster size: {cols} × {rows} px  |  pixel size: {pixel_size:.6g} map units"
@@ -552,14 +589,24 @@ class SimpliNeighborsAlgorithm(QgsProcessingAlgorithm):
 # ---------------------------------------------------------------------------
 
 def _parse_resolution(value: str) -> float | None:
+    """None for blank / "default"; a positive finite number otherwise.
+
+    Anything else is an error: an unreadable value used to mean "default"
+    without a word, so a typo silently produced the wrong resolution.
+    """
     v = value.strip().lower()
     if v in ("", "default"):
         return None
     try:
         f = float(v)
-        return f if f > 0 else None
     except ValueError:
-        return None
+        raise ValueError(
+            f"Output resolution {value!r} is not a number; use \"default\" or a "
+            f"positive number of map units per pixel")
+    if not math.isfinite(f) or f <= 0:
+        raise ValueError(
+            f"Output resolution {value!r} must be a positive number of map units per pixel")
+    return f
 
 
 def _build_tiles(rows: int, cols: int, tile_size: int, overlap: int) -> list[dict]:
@@ -656,3 +703,18 @@ def _filter_tiles(
             # tiles already running finish, then re-raise (finding 7).
             pool.shutdown(wait=True, cancel_futures=True)
             raise
+
+
+def _max_tiles() -> int:
+    """Tile limit per run: DEFAULT_MAX_TILES, or SIMPLINEIGHBORS_MAX_TILES if set.
+    An unreadable value is an error, not ignored."""
+    raw = os.environ.get("SIMPLINEIGHBORS_MAX_TILES", "").strip()
+    if not raw:
+        return DEFAULT_MAX_TILES
+    try:
+        value = int(raw)
+    except ValueError:
+        raise QgsProcessingException(f"SIMPLINEIGHBORS_MAX_TILES is not an integer: {raw!r}")
+    if value < 1:
+        raise QgsProcessingException(f"SIMPLINEIGHBORS_MAX_TILES must be at least 1, got {value}")
+    return value

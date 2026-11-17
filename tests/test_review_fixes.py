@@ -281,5 +281,36 @@ class Finding8BackendTests(unittest.TestCase):
         self.assertTrue(p.flags() & alg.QgsProcessingParameterDefinition.Flag.Advanced)
         self.assertEqual(p.defaultValue(), 0)
 
+
+
+class Finding13ValidationTests(unittest.TestCase):
+    def test_resolution_parser_rejects_garbage(self):
+        self.assertIsNone(alg._parse_resolution('default'))
+        self.assertIsNone(alg._parse_resolution(' Default '))
+        self.assertIsNone(alg._parse_resolution(''))
+        self.assertEqual(alg._parse_resolution('0.25'), 0.25)
+        for bad in ('abc', '-1', '0', 'nan', 'inf', '1,5', '0.1m'):
+            with self.assertRaises(ValueError, msg=bad):
+                alg._parse_resolution(bad)
+
+    def test_threads_maximum_is_not_this_machines_core_count(self):
+        a = alg.SimpliNeighborsAlgorithm()
+        a.initAlgorithm()
+        p = a.parameterDefinition('THREADS')
+        self.assertEqual(p.maximum(), alg.MAX_THREADS)
+        self.assertGreaterEqual(alg.MAX_THREADS, 256)
+        self.assertEqual(p.minimum(), 1)
+        self.assertEqual(p.defaultValue(), alg._CPU_COUNT)  # default unchanged
+
+    def test_tile_cap(self):
+        self.assertEqual(alg._max_tiles(), alg.DEFAULT_MAX_TILES)
+        self.assertGreater(alg.DEFAULT_MAX_TILES, 10 * 1200)  # Jackson CC DTM is about 1,200 tiles
+        with mock.patch.dict(os.environ, {'SIMPLINEIGHBORS_MAX_TILES': '12'}):
+            self.assertEqual(alg._max_tiles(), 12)
+        for bad in ('lots', '0', '-3'):
+            with mock.patch.dict(os.environ, {'SIMPLINEIGHBORS_MAX_TILES': bad}):
+                with self.assertRaises(alg.QgsProcessingException):
+                    alg._max_tiles()
+
 if __name__ == '__main__':
     unittest.main()

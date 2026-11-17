@@ -268,8 +268,13 @@ def test_resolution_parser():
     assert _parse_resolution("")        is None
     assert _parse_resolution("0.004")  == 0.004
     assert _parse_resolution("1.0")    == 1.0
-    assert _parse_resolution("-1")     is None   # negative → ignored
-    assert _parse_resolution("abc")    is None   # garbage → ignored
+    for bad in ("-1", "abc", "0", "nan", "inf"):
+        try:
+            _parse_resolution(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"{bad!r} should be rejected")
 
 test("_parse_resolution handles all cases", test_resolution_parser)
 
