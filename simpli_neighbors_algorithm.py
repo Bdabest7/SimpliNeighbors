@@ -415,6 +415,17 @@ class SimpliNeighborsAlgorithm(QgsProcessingAlgorithm):
             feedback.pushWarning(
                 f"{threads} threads requested but this machine has {_CPU_COUNT} cores")
 
+        # ---- dependencies: fail early, naming what is missing (finding 14)
+        from . import simpli_deps
+        try:
+            if smooth_mode == MODE_BILATERAL:
+                # scipy is not needed by the bilateral filter; numba only if pinned/used
+                simpli_deps.require_for(None, mode_needs_scipy=False)
+            else:
+                simpli_deps.require_for(None, mode_needs_scipy=True)
+        except ImportError as e:
+            raise QgsProcessingException(str(e))
+
         # Choose the bilateral backend, honouring a pin, and log it (finding 8).
         # The BACKEND parameter wins; when it is Auto, SIMPLINEIGHBORS_BACKEND
         # may pin one. A pinned backend that is missing is an error.

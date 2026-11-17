@@ -312,5 +312,44 @@ class Finding13ValidationTests(unittest.TestCase):
                 with self.assertRaises(alg.QgsProcessingException):
                     alg._max_tiles()
 
+
+
+class Finding14DepsTests(unittest.TestCase):
+    def test_check_reports_versions_and_pins(self):
+        from .. import simpli_deps
+        lines, missing = simpli_deps.check_dependencies()
+        self.assertEqual(missing, [])
+        self.assertTrue(any(l.startswith('dep scipy') for l in lines))
+        pins = simpli_deps._pins()
+        for name in ('numpy', 'scipy', 'numba', 'llvmlite'):
+            self.assertIn(name, pins)
+
+    def test_missing_scipy_is_named(self):
+        from .. import simpli_deps
+        with mock.patch.dict('sys.modules', {'scipy': None}):
+            lines, missing = simpli_deps.check_dependencies()
+            self.assertIn('scipy', missing)
+            with self.assertRaises(ImportError) as cm:
+                simpli_deps.require_for(None, mode_needs_scipy=True)
+            self.assertIn('scipy==', str(cm.exception))
+            simpli_deps.require_for(None, mode_needs_scipy=False)  # bilateral does not need scipy
+
+    def test_numba_required_only_when_asked(self):
+        from .. import simpli_deps
+        with mock.patch.dict('sys.modules', {'numba': None}):
+            _, missing = simpli_deps.check_dependencies()
+            self.assertNotIn('numba', missing)
+            _, missing = simpli_deps.check_dependencies(['numba'])
+            self.assertIn('numba', missing)
+
+    def test_cli_exit_codes(self):
+        import subprocess
+        import sys
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'simpli_deps.py')
+        r = subprocess.run([sys.executable, path, '--require', 'numba'], capture_output=True, text=True,
+                           cwd=tempfile.gettempdir(), timeout=300)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr[-400:])
+        self.assertIn('dep numba', r.stdout)
+
 if __name__ == '__main__':
     unittest.main()

@@ -45,7 +45,7 @@ On a modern workstation, a 10,000×10,000 DSM with radius=6 completes in a few s
 | QGIS | 4.0.0+ |
 | Python | 3.9+ (bundled with QGIS) |
 | NumPy | 1.20+ (bundled with QGIS) |
-| SciPy | 1.7+ |
+| SciPy | 1.17.0 (pinned in `requirements.txt`) |
 | GDAL/OGR | 3.x (bundled with QGIS) |
 
 > **SciPy** is the only dependency that may not be pre-installed. Install it inside the QGIS Python environment:

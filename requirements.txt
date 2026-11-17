@@ -1,0 +1,8 @@
+# Tested with the QGIS 4.0.0 Python (3.12) on the VM. NumPy and GDAL ship with QGIS;
+# SciPy, Numba and llvmlite do not, so install them ahead of time:
+#   "C:\Program Files\QGIS 4.0.0in\python-qgis.bat" -m pip install -r requirements.txt
+# Numba (and llvmlite) are only needed for the Numba CPU and CUDA backends.
+numpy==2.4.2
+scipy==1.17.0
+numba==0.65.0
+llvmlite==0.47.0
