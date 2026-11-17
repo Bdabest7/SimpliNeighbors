@@ -86,5 +86,52 @@ class Finding3ResampleTests(unittest.TestCase):
             src = f.read()
         self.assertNotIn('simplineighbors_resampled', src)
 
+
+
+class Finding7FailedTileTests(unittest.TestCase):
+    def _run(self, fake, feedback=None, threads=2):
+        data = np.zeros((2048, 2048), dtype=np.float32)
+        out = np.empty_like(data)
+        tiles = alg._build_tiles(2048, 2048, 256, 2)  # 64 tiles
+        with mock.patch.object(alg, '_filter_tile', side_effect=fake):
+            alg._filter_tiles(data, out, tiles, 5, alg.MODE_MEDIAN, 1.0, threads,
+                              feedback or Feedback())
+        return len(tiles)
+
+    def test_failed_tile_does_not_wait_for_the_rest(self):
+        import threading
+        import time
+        calls = []
+        lock = threading.Lock()
+
+        def fake(tile, *a):
+            with lock:
+                calls.append(1)
+                n = len(calls)
+            if n == 1:
+                raise ValueError('tile failed')
+            time.sleep(0.3)
+            return tile
+
+        t0 = time.time()
+        with self.assertRaises(ValueError):
+            self._run(fake)
+        elapsed = time.time() - t0
+        # 64 tiles x 0.3 s on 2 threads would be about 10 s if it waited for all of them.
+        self.assertLess(elapsed, 3.0)
+        self.assertLess(len(calls), 20)
+
+    def test_cancel_stops_quickly(self):
+        import time
+
+        def fake(tile, *a):
+            time.sleep(0.2)
+            return tile
+
+        t0 = time.time()
+        with self.assertRaises(alg.QgsProcessingException):
+            self._run(fake, feedback=Feedback(cancel_after=1))
+        self.assertLess(time.time() - t0, 3.0)
+
 if __name__ == '__main__':
     unittest.main()

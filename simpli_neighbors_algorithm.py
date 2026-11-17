@@ -468,39 +468,10 @@ class SimpliNeighborsAlgorithm(QgsProcessingAlgorithm):
             )
 
             output: np.ndarray = np.empty_like(data)
-            completed = 0
-
-            with ThreadPoolExecutor(max_workers=threads) as pool:
-                futures = {
-                    pool.submit(
-                        _filter_tile,
-                        data[t["src_r0"]:t["src_r1"], t["src_c0"]:t["src_c1"]],
-                        filter_size,
-                        smooth_mode,
-                        gaussian_sigma,
-                    ): t
-                    for t in tiles
-                }
-
-                for future in as_completed(futures):
-                    if feedback.isCanceled():
-                        pool.shutdown(wait=False, cancel_futures=True)
-                        raise QgsProcessingException("Cancelled by user.")
-
-                    tile   = futures[future]
-                    result = future.result()
-
-                    r_off = tile["dst_r0"] - tile["src_r0"]
-                    c_off = tile["dst_c0"] - tile["src_c0"]
-                    h     = tile["dst_r1"] - tile["dst_r0"]
-                    w     = tile["dst_c1"] - tile["dst_c0"]
-                    output[
-                        tile["dst_r0"]:tile["dst_r1"],
-                        tile["dst_c0"]:tile["dst_c1"],
-                    ] = result[r_off: r_off + h, c_off: c_off + w]
-
-                    completed += 1
-                    feedback.setProgress(int(completed / n_tiles * 100))
+            _filter_tiles(
+                data, output, tiles, filter_size, smooth_mode, gaussian_sigma,
+                threads, feedback,
+            )
 
         # ---- restore nodata --------------------------------------------
         if nodata_mask is not None:
@@ -589,3 +560,54 @@ def resolve_settings(parameters: dict, preset_idx: int) -> tuple[bool, str | Non
         return False, ("PRESET was not given, so the explicit " + ", ".join(explicit) +
                        " apply (Custom) instead of the default preset")
     return preset_idx != PRESET_CUSTOM, None
+
+
+def _filter_tiles(
+    data: np.ndarray,
+    output: np.ndarray,
+    tiles: list,
+    filter_size: int,
+    smooth_mode: int,
+    gaussian_sigma: float,
+    threads: int,
+    feedback,
+) -> None:
+    """Filter every tile of `data` on a thread pool and copy the cores into `output`."""
+    n_tiles = len(tiles)
+    completed = 0
+    with ThreadPoolExecutor(max_workers=threads) as pool:
+        futures = {
+            pool.submit(
+                _filter_tile,
+                data[t["src_r0"]:t["src_r1"], t["src_c0"]:t["src_c1"]],
+                filter_size,
+                smooth_mode,
+                gaussian_sigma,
+            ): t
+            for t in tiles
+        }
+        try:
+            for future in as_completed(futures):
+                if feedback.isCanceled():
+                    raise QgsProcessingException("Cancelled by user.")
+
+                tile   = futures[future]
+                result = future.result()
+
+                r_off = tile["dst_r0"] - tile["src_r0"]
+                c_off = tile["dst_c0"] - tile["src_c0"]
+                h     = tile["dst_r1"] - tile["dst_r0"]
+                w     = tile["dst_c1"] - tile["dst_c0"]
+                output[
+                    tile["dst_r0"]:tile["dst_r1"],
+                    tile["dst_c0"]:tile["dst_c1"],
+                ] = result[r_off: r_off + h, c_off: c_off + w]
+
+                completed += 1
+                feedback.setProgress(int(completed / n_tiles * 100))
+        except BaseException:
+            # A failed tile (or a cancel) must not wait for every
+            # remaining tile: drop the queued ones, let only the
+            # tiles already running finish, then re-raise (finding 7).
+            pool.shutdown(wait=True, cancel_futures=True)
+            raise
