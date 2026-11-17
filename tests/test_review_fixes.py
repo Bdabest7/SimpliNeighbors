@@ -351,5 +351,51 @@ class Finding14DepsTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr[-400:])
         self.assertIn('dep numba', r.stdout)
 
+
+
+class Finding15GdalSettingsTests(unittest.TestCase):
+    def tearDown(self):
+        gdal.UseExceptions()  # this test module's own default
+
+    def test_exceptions_state_restored_after_run_and_failure(self):
+        a = alg.SimpliNeighborsAlgorithm()
+        seen = []
+
+        def ok(*args):
+            seen.append(gdal.GetUseExceptions())
+            return {}
+
+        def boom(*args):
+            seen.append(gdal.GetUseExceptions())
+            raise RuntimeError('x')
+
+        gdal.DontUseExceptions()
+        with mock.patch.object(a, '_process', side_effect=ok):
+            a.processAlgorithm({}, None, None)
+        self.assertEqual(seen, [True])          # on during the run
+        self.assertFalse(gdal.GetUseExceptions())  # restored after
+
+        with mock.patch.object(a, '_process', side_effect=boom):
+            with self.assertRaises(RuntimeError):
+                a.processAlgorithm({}, None, None)
+        self.assertFalse(gdal.GetUseExceptions())
+
+        gdal.UseExceptions()
+        with mock.patch.object(a, '_process', side_effect=ok):
+            a.processAlgorithm({}, None, None)
+        self.assertTrue(gdal.GetUseExceptions())  # was on before, stays on
+
+    def test_importing_the_module_does_not_change_the_setting(self):
+        import subprocess
+        import sys
+        code = ("from osgeo import gdal\n"
+                "gdal.DontUseExceptions()\n"
+                "from SimpliNeighbors import simpli_neighbors_algorithm\n"
+                "print(gdal.GetUseExceptions())\n")
+        plugins = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        r = subprocess.run([sys.executable, '-c', code], env=dict(os.environ, PYTHONPATH=os.pathsep.join(filter(None, [plugins, os.environ.get('PYTHONPATH', '')]))),
+                           capture_output=True, text=True, cwd=tempfile.gettempdir(), timeout=300)
+        self.assertIn(r.stdout.strip().splitlines()[-1], ('0', 'False'), r.stderr[-400:])
+
 if __name__ == '__main__':
     unittest.main()

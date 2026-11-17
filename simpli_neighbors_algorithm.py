@@ -17,12 +17,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import math
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
-from osgeo import gdal
+from osgeo import gdal, ogr, osr
 
 from qgis.core import (
     QgsProcessingAlgorithm,
@@ -37,7 +38,6 @@ from qgis.core import (
     QgsProcessingParameterString,
 )
 
-gdal.UseExceptions()
 
 TILE_SIZE = 512  # px — good L2/L3 cache footprint per thread
 _CPU_COUNT = os.cpu_count() or 1
@@ -356,6 +356,17 @@ class SimpliNeighborsAlgorithm(QgsProcessingAlgorithm):
 
 
     def processAlgorithm(
+        self,
+        parameters: dict,
+        context: QgsProcessingContext,
+        feedback: QgsProcessingFeedback,
+    ) -> dict:
+        # GDAL exceptions are switched on for this run only and the previous
+        # setting is restored afterwards (finding 15).
+        with _gdal_exceptions():
+            return self._process(parameters, context, feedback)
+
+    def _process(
         self,
         parameters: dict,
         context: QgsProcessingContext,
@@ -729,3 +740,19 @@ def _max_tiles() -> int:
     if value < 1:
         raise QgsProcessingException(f"SIMPLINEIGHBORS_MAX_TILES must be at least 1, got {value}")
     return value
+
+
+@contextlib.contextmanager
+def _gdal_exceptions():
+    """Turn GDAL (and OGR/OSR) exceptions on for a run, then restore what was set before."""
+    mods = (gdal, ogr, osr)
+    prev = {m: bool(m.GetUseExceptions()) if hasattr(m, "GetUseExceptions") else False for m in mods}
+    gdal.UseExceptions()
+    try:
+        yield
+    finally:
+        for m, was_on in prev.items():
+            if was_on:
+                m.UseExceptions()
+            else:
+                m.DontUseExceptions()
